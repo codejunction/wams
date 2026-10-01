@@ -1,6 +1,6 @@
 # WAMS: Who Ate My Storage
 
-A small native Windows app (Rust + egui, ~5 MB) that shows the size of every folder and file on all your drives, laid out as an expandable tree with breadcrumbs.
+A small native Windows app (Rust + egui, ~5 MB) that shows where your disk space went. It has a Windows 11 style tree explorer with folder and file sizes, disk analysis, and a cloud backup check.
 
 ![screenshot](screenshot.png)
 
@@ -15,23 +15,32 @@ irm https://github.com/codejunction/wams/releases/latest/download/wams.exe -OutF
 The first launch installs WAMS for the current user:
 
 - copies itself to `%LOCALAPPDATA%\Programs\wams\wams.exe`
-- registers itself to start at login (`HKCU\...\Run`), so a fresh scan is ready after every boot
-- adds itself to **Settings > Apps** so you can uninstall it there
+- starts at login (`HKCU\...\Run`), so a fresh scan is ready after every boot
+- shows up in **Settings > Apps**, where you can uninstall it
 
 To try it without installing, run `wams.exe --portable`. To uninstall from the command line, run `wams.exe --uninstall`.
 
+The exe isn't code-signed, so SmartScreen may warn on first run: choose **More info > Run anyway**.
+
+## What you get
+
+- **Explorer**: a tree of every drive with size, file count and share of the parent folder. Breadcrumbs, an up button, and a details pane for whatever you select.
+- **Disk analysis**: used/free per drive, how much space is system or protected data WAMS can't read, a treemap of the current folder, the largest files, and space by file type.
+- **Cloud backup**: finds the sync folders registered with Windows (OneDrive, Google Drive, Dropbox, iCloud, Box) and marks each folder in your home folder and each known folder (Desktop, Documents, Pictures, …) as **Backed up** or **Not backed up**. Online-only (Files On-Demand) files are counted separately, because they take no space on this PC.
+- **Drive tags**: drives are tagged **System**, **Local**, **USB**, **Network** or **Cloud**. Network and virtual cloud drives are listed with their capacity but not scanned. Clicking one opens it in Windows Explorer.
+- Follows the Windows light/dark theme and your accent colour, and uses the system Segoe UI and Segoe Fluent Icons fonts.
+
 ## Usage
 
-- **Click** a folder to expand or collapse it.
-- **Double-click** a folder to open it; the breadcrumb bar shows where you are. Click a breadcrumb to go back up.
-- **Double-click** a file, or **right-click** any row, to show it in Windows Explorer.
-- **Refresh** rescans all drives.
+- **Click** a row to select it. Click the arrow to expand or collapse a folder.
+- **Double-click** a folder to open it, or a file to show it in Windows Explorer.
+- **Right-click** any row: Open, Show in Explorer, Copy path.
+- **Rescan all drives** (bottom left) rescans everything.
 
 ## Notes
 
 - Sizes are logical file sizes. Symlinks and junctions are skipped, so nothing is counted twice.
-- Without admin rights, some protected system folders can't be read, so their totals come out a little low.
-- Every drive letter is scanned, including USB and network drives.
+- Without admin rights some protected folders can't be read. Disk analysis shows how much space that is per drive.
 
 ## Build
 
