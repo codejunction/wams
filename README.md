@@ -1,8 +1,10 @@
 # WAMS: Who Ate My Storage
 
-A small native Windows app (Rust + egui, ~5 MB) that shows where your disk space went. It has a Windows 11 style tree explorer with folder and file sizes, disk analysis, and a cloud backup check.
+A small native Windows app (Rust + egui, ~5 MB) that shows where your disk space went. It has a dark, compact tree explorer (styled after the [Atlas](https://atlasfm.modhyt.org/) file manager) with folder and file sizes, disk analysis, and a cloud backup check.
 
-![screenshot](screenshot.png)
+![Explorer](screenshot.png)
+
+![Disk analysis](screenshot-analysis.png)
 
 ## Run on any Windows PC
 
@@ -28,7 +30,7 @@ The exe isn't code-signed, so SmartScreen may warn on first run: choose **More i
 - **Disk analysis**: used/free per drive, how much space is system or protected data WAMS can't read, a treemap of the current folder, the largest files, and space by file type.
 - **Cloud backup**: finds the sync folders registered with Windows (OneDrive, Google Drive, Dropbox, iCloud, Box) and marks each folder in your home folder and each known folder (Desktop, Documents, Pictures, …) as **Backed up** or **Not backed up**. Online-only (Files On-Demand) files are counted separately, because they take no space on this PC.
 - **Drive tags**: drives are tagged **System**, **Local**, **USB**, **Network** or **Cloud**. Network and virtual cloud drives are listed with their capacity but not scanned. Clicking one opens it in Windows Explorer.
-- Follows the Windows light/dark theme and your accent colour, and uses the system Segoe UI and Segoe Fluent Icons fonts.
+- Dark theme with a blue accent, dense zebra-striped rows and monochrome icons. Uses the system Segoe UI and Segoe Fluent Icons fonts.
 
 ## Usage
 
@@ -49,3 +51,5 @@ cargo build --release   # target/release/wams.exe
 cargo test
 cargo run -- --portable # run without installing
 ```
+
+macOS (experimental, not tested on a Mac yet): `cargo build --release` on a Mac. It scans `/` and every volume in `/Volumes`, and reads iCloud Drive and `~/Library/CloudStorage` sync folders.

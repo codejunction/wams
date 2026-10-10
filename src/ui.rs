@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 
 /// Segoe Fluent Icons / MDL2 Assets code points (loaded from C:\Windows\Fonts).
+#[cfg(windows)]
 mod icon {
     pub const FOLDER: &str = "\u{E8B7}";
     pub const FOLDER_OPEN: &str = "\u{E838}";
@@ -36,8 +37,37 @@ mod icon {
     pub const UP: &str = "\u{E74A}";
 }
 
-const ROW_H: f32 = 32.0;
-const FOLDER_YELLOW: Color32 = Color32::from_rgb(255, 200, 61);
+/// macOS: glyphs from egui's bundled emoji-icon-font / Noto Emoji.
+#[cfg(not(windows))]
+mod icon {
+    pub const FOLDER: &str = "🗀";
+    pub const FOLDER_OPEN: &str = "🗁";
+    pub const FILE: &str = "🗋";
+    pub const DRIVE: &str = "🖴";
+    pub const CLOUD: &str = "☁";
+    pub const REFRESH: &str = "⟳";
+    pub const HOME: &str = "🏠";
+    pub const DESKTOP: &str = "🖵";
+    pub const DOCS: &str = "🗐";
+    pub const DOWNLOAD: &str = "⬇";
+    pub const PICTURES: &str = "🖼";
+    pub const MUSIC: &str = "🎵";
+    pub const VIDEO: &str = "🎞";
+    pub const PIE: &str = "◔";
+    pub const EXPLORER: &str = "🗄";
+    pub const PC: &str = "🖥";
+    pub const RIGHT: &str = "⏵";
+    pub const DOWN: &str = "⏷";
+    pub const CHECK: &str = "✔";
+    pub const WARN: &str = "⚠";
+    pub const COPY: &str = "🗐";
+    pub const OPEN: &str = "⮫";
+    pub const UP: &str = "⬆";
+}
+
+const ROW_H: f32 = 24.0;
+const FOLDER_GREY: Color32 = Color32::from_rgb(128, 128, 128);
+const ACCENT: Color32 = Color32::from_rgb(10, 132, 255);
 const TILE_COLORS: [Color32; 8] = [
     Color32::from_rgb(56, 132, 255),
     Color32::from_rgb(139, 92, 246),
@@ -49,7 +79,7 @@ const TILE_COLORS: [Color32; 8] = [
     Color32::from_rgb(132, 204, 22),
 ];
 
-/// Windows 11 style palette for one theme.
+/// Atlas-style palette for one theme.
 struct Pal {
     nav: Color32,
     content: Color32,
@@ -68,15 +98,15 @@ fn pal(dark: bool, accent: Color32) -> Pal {
     let c = Color32::from_rgb;
     if dark {
         Pal {
-            nav: c(32, 32, 32),
-            content: c(28, 28, 28),
-            card: c(43, 43, 43),
-            stroke: c(56, 56, 56),
-            hover: c(55, 55, 55),
-            track: c(70, 70, 70),
-            text: c(255, 255, 255),
-            weak: c(160, 160, 160),
-            accent: accent.lerp_to_gamma(Color32::WHITE, 0.35),
+            nav: c(19, 19, 19),
+            content: c(28, 28, 30),
+            card: c(28, 28, 30),
+            stroke: c(44, 44, 46),
+            hover: c(44, 44, 46),
+            track: c(44, 44, 46),
+            text: c(229, 229, 234),
+            weak: c(142, 142, 147),
+            accent,
             ok: c(108, 203, 95),
             warn: c(252, 166, 72),
         }
@@ -97,28 +127,27 @@ fn pal(dark: bool, accent: Color32) -> Pal {
     }
 }
 
-/// The user's Windows accent color.
-fn system_accent() -> Color32 {
-    winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
-        .open_subkey(r"Software\Microsoft\Windows\DWM")
-        .and_then(|k| k.get_value::<u32, _>("AccentColor"))
-        .map(|v| Color32::from_rgb(v as u8, (v >> 8) as u8, (v >> 16) as u8))
-        .unwrap_or(Color32::from_rgb(0, 120, 212))
-}
-
 fn semibold(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name("semibold".into()))
 }
 
-/// Segoe UI + Segoe Fluent Icons from the system, egui's bundled fonts as fallback.
+/// System UI font (Segoe UI / SF Pro) + Segoe Fluent Icons on Windows, egui's bundled fonts as fallback.
 fn load_fonts(ctx: &egui::Context) {
-    let dir = PathBuf::from(std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into())).join("Fonts");
+    #[cfg(windows)]
+    let (dir, ui, icons, semi): (PathBuf, &[&str], &[&str], &[&str]) = (
+        PathBuf::from(std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into())).join("Fonts"),
+        &["segoeui.ttf"],
+        &["SegoeIcons.ttf", "segmdl2.ttf"],
+        &["seguisb.ttf"],
+    );
+    #[cfg(not(windows))]
+    let (dir, ui, icons, semi): (PathBuf, &[&str], &[&str], &[&str]) = ("/System/Library/Fonts".into(), &["SFNS.ttf"], &[], &[]);
     let mut f = egui::FontDefinitions::default();
     let mut put = |key: &str, files: &[&str]| {
         let bytes = files.iter().find_map(|n| std::fs::read(dir.join(n)).ok());
         bytes.map(|b| f.font_data.insert(key.into(), Arc::new(egui::FontData::from_owned(b)))).is_some()
     };
-    let (seg, ico, sb) = (put("segoe", &["segoeui.ttf"]), put("icons", &["SegoeIcons.ttf", "segmdl2.ttf"]), put("semibold", &["seguisb.ttf"]));
+    let (seg, ico, sb) = (put("segoe", ui), put("icons", icons), put("semibold", semi));
     let prop = f.families.get_mut(&FontFamily::Proportional).unwrap();
     if ico {
         prop.insert(0, "icons".into());
@@ -167,12 +196,12 @@ fn apply_theme(ctx: &egui::Context, accent: Color32) {
     ctx.all_styles_mut(|s| {
         s.spacing.item_spacing = vec2(8.0, 6.0);
         s.spacing.button_padding = vec2(12.0, 6.0);
-        s.spacing.interact_size.y = 30.0;
+        s.spacing.interact_size.y = 26.0;
         use egui::TextStyle::*;
         s.text_styles = [
             (Small, FontId::proportional(12.0)),
-            (Body, FontId::proportional(14.0)),
-            (Button, FontId::proportional(14.0)),
+            (Body, FontId::proportional(13.0)),
+            (Button, FontId::proportional(13.0)),
             (Monospace, FontId::monospace(13.0)),
             (Heading, semibold(26.0)),
         ]
@@ -304,14 +333,18 @@ fn walk(d: &Dir, path: &Path, depth: f32, open: &HashSet<PathBuf>, files: &mut F
     }
 }
 
-fn explorer(arg: String) {
+#[cfg(windows)]
+fn show_in_explorer(p: &Path, dir: bool) {
     use std::os::windows::process::CommandExt;
+    let p = p.display();
+    let arg = if dir { format!("\"{p}\"") } else { format!("/select,\"{p}\"") };
     let _ = std::process::Command::new("explorer").raw_arg(arg).spawn();
 }
 
+/// Finder: open the folder, or reveal the file.
+#[cfg(not(windows))]
 fn show_in_explorer(p: &Path, dir: bool) {
-    let p = p.display();
-    explorer(if dir { format!("\"{p}\"") } else { format!("/select,\"{p}\"") });
+    let _ = std::process::Command::new("open").args(if dir { &[][..] } else { &["-R"][..] }).arg(p).spawn();
 }
 
 fn card(p: &Pal) -> egui::Frame {
@@ -366,24 +399,19 @@ fn text(ui: &Ui, pos: egui::Pos2, align: Align2, s: &str, font: FontId, color: C
 
 fn section(ui: &mut Ui, p: &Pal, title: &str) {
     ui.add_space(14.0);
-    ui.label(RichText::new(title).size(12.0).color(p.weak));
+    ui.label(RichText::new(title).font(semibold(12.0)).color(p.weak));
     ui.add_space(2.0);
 }
 
 /// Win11 navigation item: icon + label, accent pill when active.
 fn nav_item(ui: &mut Ui, p: &Pal, icon: &str, label: &str, active: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 27.0), Sense::click());
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
     let bg = if active || resp.hovered() { p.hover } else { Color32::TRANSPARENT };
     ui.painter().rect_filled(rect, 6.0, bg);
-    if active {
-        let pill = Rect::from_center_size(pos2(rect.left() + 2.0, rect.center().y), vec2(3.0, 16.0));
-        ui.painter().rect_filled(pill, 2.0, p.accent);
-    }
     let y = rect.center().y;
-    let ic = if active { p.accent } else { p.text };
-    text(ui, pos2(rect.left() + 14.0, y), Align2::LEFT_CENTER, icon, FontId::proportional(16.0), ic);
-    text(ui, pos2(rect.left() + 44.0, y), Align2::LEFT_CENTER, label, FontId::proportional(14.0), p.text);
+    text(ui, pos2(rect.left() + 10.0, y), Align2::LEFT_CENTER, icon, FontId::proportional(14.0), p.text);
+    text(ui, pos2(rect.left() + 34.0, y), Align2::LEFT_CENTER, label, FontId::proportional(13.0), p.text);
     resp.on_hover_cursor(CursorIcon::PointingHand)
 }
 
@@ -421,8 +449,9 @@ pub struct App {
 impl App {
     pub fn new(ctx: &egui::Context) -> Self {
         load_fonts(ctx);
-        let accent = system_accent();
+        let accent = ACCENT;
         apply_theme(ctx, accent);
+        ctx.set_theme(egui::Theme::Dark);
         let mut app = App {
             scan: None,
             rx: None,
@@ -564,7 +593,7 @@ impl App {
     fn explorer_view(&self, ui: &mut Ui, p: &Pal, acts: &mut Vec<Act>) {
         self.header(ui, p, acts);
         ui.add_space(10.0);
-        card(p).inner_margin(Margin::symmetric(0, 6)).show(ui, |ui| {
+        egui::Frame::new().show(ui, |ui| {
             ui.set_min_size(ui.available_size());
             let (head, _) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
             let (y, r, l) = (head.center().y, head.right(), head.left() + 16.0);
@@ -592,30 +621,29 @@ impl App {
     fn row(&self, ui: &mut Ui, p: &Pal, r: &Row, idx: usize, acts: &mut Vec<Act>) {
         let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
         resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("{}, {}", r.name, human(r.size))));
-        let inner = rect.shrink2(vec2(6.0, 1.0));
-        if self.selected.as_ref() == Some(&r.path) {
-            ui.painter().rect_filled(inner, 4.0, p.accent.gamma_multiply(0.22));
-        } else if resp.hovered() {
-            ui.painter().rect_filled(inner, 4.0, p.hover);
-        }
+        let sel = self.selected.as_ref() == Some(&r.path);
+        let bg = if sel { p.accent } else if resp.hovered() { p.hover } else if idx % 2 == 1 { p.nav.gamma_multiply(0.6) } else { Color32::TRANSPARENT };
+        ui.painter().rect_filled(rect, 0.0, bg);
+        let (fg, weak) = if sel { (Color32::WHITE, Color32::WHITE) } else { (p.text, p.weak) };
         let (y, rr) = (rect.center().y, rect.right());
         let x = rect.left() + 16.0 + r.depth * 20.0;
         let arrow = Rect::from_min_max(pos2(x - 6.0, rect.top()), pos2(x + 18.0, rect.bottom()));
         if r.dir {
             let a = if r.open { icon::DOWN } else { icon::RIGHT };
-            text(ui, pos2(x + 6.0, y), Align2::CENTER_CENTER, a, FontId::proportional(10.0), p.weak);
+            text(ui, pos2(x + 6.0, y), Align2::CENTER_CENTER, a, FontId::proportional(10.0), weak);
         }
         let drive = self.scan.as_ref().and_then(|s| s.drive(&r.path));
         let (ic, tint) = match (r.dir, r.open) {
-            _ if drive.is_some() => (icon::DRIVE, p.text),
-            (true, true) => (icon::FOLDER_OPEN, FOLDER_YELLOW),
-            (true, false) => (icon::FOLDER, FOLDER_YELLOW),
-            _ => (icon::FILE, p.weak),
+            _ if drive.is_some() => (icon::DRIVE, fg),
+            (true, true) => (icon::FOLDER_OPEN, FOLDER_GREY),
+            (true, false) => (icon::FOLDER, FOLDER_GREY),
+            _ => (icon::FILE, weak),
         };
-        text(ui, pos2(x + 22.0, y), Align2::LEFT_CENTER, ic, FontId::proportional(16.0), tint);
+        let tint = if sel { fg } else { tint };
+        text(ui, pos2(x + 22.0, y), Align2::LEFT_CENTER, ic, FontId::proportional(14.0), tint);
         let name_clip = Rect::from_x_y_ranges(x + 44.0..=rr - 330.0, rect.y_range());
         let label = drive.map_or_else(|| r.name.clone(), drive_name);
-        let nr = ui.painter().with_clip_rect(name_clip).text(pos2(x + 46.0, y), Align2::LEFT_CENTER, label, FontId::proportional(14.0), p.text);
+        let nr = ui.painter().with_clip_rect(name_clip).text(pos2(x + 46.0, y), Align2::LEFT_CENTER, label, FontId::proportional(13.0), fg);
         if let Some(d) = drive {
             if let Some(c) = kind_color(p, d.kind) {
                 pill(ui, pos2(nr.right() + 8.0, y), &format!("{} drive", d.kind.name()), c);
@@ -632,12 +660,12 @@ impl App {
             ui.interact(sr.expand(4.0), ui.id().with(("status", idx)), Sense::hover()).on_hover_text(tip);
         }
         if r.dir {
-            text(ui, pos2(rr - 236.0, y), Align2::RIGHT_CENTER, &num(r.files), FontId::proportional(13.0), p.weak);
+            text(ui, pos2(rr - 236.0, y), Align2::RIGHT_CENTER, &num(r.files), FontId::proportional(13.0), weak);
         }
-        text(ui, pos2(rr - 148.0, y), Align2::RIGHT_CENTER, &human(r.size), FontId::proportional(14.0), p.text);
+        text(ui, pos2(rr - 148.0, y), Align2::RIGHT_CENTER, &human(r.size), FontId::proportional(13.0), fg);
         let share = r.size as f32 / r.parent.max(1) as f32;
-        bar(ui, Rect::from_min_max(pos2(rr - 132.0, y - 3.0), pos2(rr - 62.0, y + 3.0)), share, p.accent, p.track);
-        text(ui, pos2(rr - 16.0, y), Align2::RIGHT_CENTER, &format!("{:.0}%", share * 100.0), FontId::proportional(12.5), p.weak);
+        bar(ui, Rect::from_min_max(pos2(rr - 132.0, y - 3.0), pos2(rr - 62.0, y + 3.0)), share, if sel { fg } else { p.accent }, p.track);
+        text(ui, pos2(rr - 16.0, y), Align2::RIGHT_CENTER, &format!("{:.0}%", share * 100.0), FontId::proportional(12.5), weak);
 
         if resp.double_clicked() {
             if r.dir {
@@ -669,11 +697,11 @@ impl App {
         self.header(ui, p, acts);
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             ui.add_space(10.0);
-            ui.with_layout(egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true), |ui| {
-                ui.spacing_mut().item_spacing = vec2(12.0, 12.0);
-                for d in &s.drives {
+            ui.spacing_mut().item_spacing.x = 12.0;
+            ui.columns(s.drives.len().max(1), |cols| {
+                for (ui, d) in cols.iter_mut().zip(&s.drives) {
                     let resp = card(p).show(ui, |ui| {
-                        ui.set_width(236.0);
+                        ui.set_min_width(ui.available_width());
                         let used = d.total.saturating_sub(d.free);
                         let frac = used as f32 / d.total.max(1) as f32;
                         ui.horizontal(|ui| {
@@ -871,7 +899,7 @@ impl App {
                         Some(r) => (format!("Backed up · {}", r.provider), p.ok),
                         None => ("Not backed up".to_string(), p.warn),
                     };
-                    self.folder_row(ui, p, ic, FOLDER_YELLOW, name, path, size_of(path).0, (&status.0, status.1), acts);
+                    self.folder_row(ui, p, ic, FOLDER_GREY, name, path, size_of(path).0, (&status.0, status.1), acts);
                 }
             });
         });
@@ -906,12 +934,8 @@ impl App {
         let (size, local, kind_icon, tint) = match (dir, &meta) {
             (Some(d), _) if pc => (d.size, d.local, icon::PC, p.accent),
             (Some(d), _) if s.drive(&target).is_some() => (d.size, d.local, icon::DRIVE, p.accent),
-            (Some(d), _) => (d.size, d.local, icon::FOLDER, FOLDER_YELLOW),
-            (None, Some(m)) => {
-                use std::os::windows::fs::MetadataExt;
-                let cloud = m.file_attributes() & 0x0040_1000 != 0;
-                (m.len(), if cloud { 0 } else { m.len() }, icon::FILE, p.weak)
-            }
+            (Some(d), _) => (d.size, d.local, icon::FOLDER, FOLDER_GREY),
+            (None, Some(m)) => (m.len(), if scan::cloud_only(m) { 0 } else { m.len() }, icon::FILE, p.weak),
             _ => {
                 ui.label(RichText::new("Select a file or folder to see details.").color(p.weak));
                 return;
@@ -1054,8 +1078,8 @@ impl eframe::App for App {
         let side = |m: i8| egui::Frame::new().fill(p.nav).inner_margin(Margin::same(m));
         egui::Panel::left("nav").exact_size(252.0).resizable(false).show_separator_line(false).frame(side(12)).show(root, |ui| self.nav(ui, &p, &mut acts));
         egui::Panel::right("details").exact_size(300.0).resizable(false).show_separator_line(false).frame(side(16)).show(root, |ui| self.details(ui, &p, &mut acts));
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(p.nav).inner_margin(Margin::symmetric(0, 10))).show(root, |ui| {
-            egui::Frame::new().fill(p.content).stroke(Stroke::new(1.0, p.stroke)).corner_radius(8.0).inner_margin(20.0).show(ui, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(p.content)).show(root, |ui| {
+            egui::Frame::new().inner_margin(16.0).show(ui, |ui| {
                 ui.set_min_size(ui.available_size());
                 match (&self.scan, self.view) {
                     (None, _) => self.loading(ui, &p),

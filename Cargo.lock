@@ -2704,6 +2704,7 @@ name = "wams"
 version = "0.2.0"
 dependencies = [
  "eframe",
+ "libc",
  "rayon",
  "windows-sys 0.61.2",
  "winreg",

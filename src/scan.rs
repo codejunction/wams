@@ -2,15 +2,31 @@
 
 use rayon::prelude::*;
 use std::collections::HashMap;
-use std::os::windows::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(windows)]
 use winreg::RegKey;
+#[cfg(windows)]
 use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
 
-/// Online-only cloud placeholder (Files On-Demand): counted in size, takes no space on this PC.
-const CLOUD_ONLY: u32 = 0x0040_0000 | 0x0000_1000; // RECALL_ON_DATA_ACCESS | OFFLINE
+/// Online-only cloud placeholder (Windows Files On-Demand, macOS dataless File Provider file):
+/// counted in size, takes no space on this PC.
+#[cfg(windows)]
+pub fn cloud_only(m: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    m.file_attributes() & (0x0040_0000 | 0x0000_1000) != 0 // RECALL_ON_DATA_ACCESS | OFFLINE
+}
+
+#[cfg(target_os = "macos")]
+pub fn cloud_only(m: &std::fs::Metadata) -> bool {
+    use std::os::macos::fs::MetadataExt;
+    m.st_flags() & 0x4000_0000 != 0 // SF_DATALESS
+}
+
+/// macOS: mount points and firmlink mirrors under "/" that would be counted twice or never finish.
+#[cfg(target_os = "macos")]
+const SKIP: [&str; 5] = ["/Volumes", "/System/Volumes", "/dev", "/net", "/home"];
 const BIG_FILE: u64 = 64 << 20;
 
 /// Only directories are kept in memory; files are listed on demand when a folder is opened.
@@ -39,6 +55,7 @@ impl Drive {
 }
 
 #[derive(Clone, Copy, PartialEq)]
+#[cfg_attr(not(windows), allow(dead_code))] // macOS has no USB/Cloud drive detection
 pub enum Kind {
     System,
     Local,
@@ -88,8 +105,8 @@ impl Scan {
     /// The sync root this path is inside of, if any.
     pub fn synced(&self, path: &Path) -> Option<&SyncRoot> {
         let s = path.to_string_lossy().to_lowercase();
-        let s = s.trim_end_matches('\\');
-        self.sync.iter().find(|r| s == r.key || s.strip_prefix(&r.key).is_some_and(|t| t.starts_with('\\')))
+        let s = s.trim_end_matches(MAIN_SEPARATOR);
+        self.sync.iter().find(|r| s == r.key || s.strip_prefix(&r.key).is_some_and(|t| t.starts_with(MAIN_SEPARATOR)))
     }
 }
 
@@ -103,22 +120,17 @@ fn scan(path: &Path, name: String, count: &AtomicU64, acc: &Acc) -> Dir {
     let (mut size, mut local, mut files) = (0, 0, 0);
     let mut subs = Vec::new();
     let mut exts: HashMap<String, (u64, u64)> = HashMap::new();
-    for e in std::fs::read_dir(path).into_iter().flatten().flatten() {
-        let Ok(ft) = e.file_type() else { continue };
-        if ft.is_symlink() {
-            continue; // also skips junctions: no double counting, no loops
-        }
-        if ft.is_dir() {
-            subs.push(e);
-        } else if let Ok(m) = e.metadata() {
-            let len = m.len();
+    for e in entries(path) {
+        if e.dir {
+            subs.push(e.name);
+        } else {
+            let len = e.len;
             size += len;
             files += 1;
-            if m.file_attributes() & CLOUD_ONLY == 0 {
+            if !e.cloud {
                 local += len;
             }
-            let fname = e.file_name();
-            let ext = Path::new(&fname).extension().map(|x| x.to_string_lossy()).unwrap_or_default();
+            let ext = Path::new(&e.name).extension().map(|x| x.to_string_lossy()).unwrap_or_default();
             let x = match exts.get_mut(ext.as_ref()) {
                 Some(x) => x, // hot path: no allocation for an extension already seen in this folder
                 None => exts.entry(ext.to_lowercase()).or_default(),
@@ -126,9 +138,13 @@ fn scan(path: &Path, name: String, count: &AtomicU64, acc: &Acc) -> Dir {
             x.0 += len;
             x.1 += 1;
             if len >= BIG_FILE {
-                acc.big.lock().unwrap().push((len, e.path()));
+                acc.big.lock().unwrap().push((len, path.join(&e.name)));
             }
         }
+    }
+    #[cfg(target_os = "macos")]
+    if path == Path::new("/") {
+        subs.retain(|n| !SKIP.iter().any(|s| path.join(n) == Path::new(s)));
     }
     count.fetch_add(files, Ordering::Relaxed);
     if !exts.is_empty() {
@@ -141,7 +157,7 @@ fn scan(path: &Path, name: String, count: &AtomicU64, acc: &Acc) -> Dir {
     }
     let mut dirs: Vec<Dir> = subs
         .par_iter()
-        .map(|e| scan(&e.path(), e.file_name().to_string_lossy().into(), count, acc))
+        .map(|n| scan(&path.join(n), n.to_string_lossy().into(), count, acc))
         .collect();
     dirs.sort_by(|a, b| b.size.cmp(&a.size));
     for d in &dirs {
@@ -169,24 +185,42 @@ pub fn scan_all(count: &AtomicU64) -> Scan {
 
 /// (name, size, online-only) of the files directly inside `p`.
 pub fn list_files(p: &Path) -> Vec<(String, u64, bool)> {
-    std::fs::read_dir(p)
+    entries(p).into_iter().filter(|e| !e.dir).map(|e| (e.name.to_string_lossy().into(), e.len, e.cloud)).collect()
+}
+
+struct Entry {
+    name: std::ffi::OsString,
+    dir: bool,
+    len: u64,
+    cloud: bool,
+}
+
+/// One directory's entries. Symlinks and junctions are skipped: no double counting, no loops.
+// ponytail: tried FindFirstFileExW + large fetch, no measurable gain (disk bound); MFT reading is the next step up
+fn entries(dir: &Path) -> Vec<Entry> {
+    std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
         .filter_map(|e| {
-            let m = e.metadata().ok()?;
-            Some((e.file_name().to_string_lossy().into(), m.len(), m.file_attributes() & CLOUD_ONLY != 0))
+            let ft = e.file_type().ok().filter(|t| !t.is_symlink())?;
+            let m = if ft.is_dir() { None } else { Some(e.metadata().ok()?) };
+            Some(Entry { name: e.file_name(), dir: ft.is_dir(), len: m.as_ref().map_or(0, |m| m.len()), cloud: m.as_ref().is_some_and(cloud_only) })
         })
         .collect()
 }
 
-/// Path to tree names. The drive comes back as one name ("C:" + "\" = "C:\").
+/// Path to tree names. The drive comes back as one name ("C:" + "\" = "C:\", or "/Volumes/X" on macOS).
 pub fn names_of(p: &Path) -> Vec<String> {
     let mut f: Vec<String> = p.iter().map(|c| c.to_string_lossy().into()).collect();
     if f.len() >= 2 && f[1] == "\\" {
         let sep = f.remove(1);
         f[0].push_str(&sep);
+    }
+    #[cfg(target_os = "macos")]
+    if f.len() >= 3 && f[0] == "/" && f[1] == "Volumes" {
+        let vol = format!("/Volumes/{}", f[2]);
+        f.splice(..3, [vol]);
     }
     f
 }
@@ -199,12 +233,14 @@ pub fn find<'a>(root: &'a Dir, names: &[String]) -> Option<&'a Dir> {
     Some(d)
 }
 
+#[cfg(windows)]
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain([0]).collect()
 }
 
 /// Every drive letter except optical drives, tagged System / Local / USB / Network / Cloud.
 // ponytail: a disconnected network drive can make this call slow; it runs on the scan thread so the UI stays live
+#[cfg(windows)]
 fn drives() -> Vec<Drive> {
     use windows_sys::Win32::Storage::FileSystem::*;
     let system = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into()) + "\\";
@@ -245,8 +281,67 @@ fn drives() -> Vec<Drive> {
         .collect()
 }
 
+/// "/" plus every mounted volume in /Volumes. Network mounts are listed but not walked.
+// ponytail: external disks show as Local, telling USB apart needs IOKit
+#[cfg(target_os = "macos")]
+fn drives() -> Vec<Drive> {
+    let stat = |root: &str| {
+        let c = std::ffi::CString::new(root).ok()?;
+        let mut s: libc::statfs = unsafe { std::mem::zeroed() };
+        (unsafe { libc::statfs(c.as_ptr(), &mut s) } == 0).then_some(s)
+    };
+    let mut out = vec![];
+    if let Some(s) = stat("/") {
+        let b = s.f_bsize as u64;
+        out.push(Drive { root: "/".into(), label: "Macintosh HD".into(), kind: Kind::System, total: s.f_blocks * b, free: s.f_bavail * b });
+    }
+    for e in std::fs::read_dir("/Volumes").into_iter().flatten().flatten() {
+        if e.file_type().is_ok_and(|t| t.is_symlink()) {
+            continue; // "Macintosh HD" -> "/"
+        }
+        let root = e.path().to_string_lossy().into_owned();
+        let Some(s) = stat(&root) else { continue };
+        let fs = unsafe { std::ffi::CStr::from_ptr(s.f_fstypename.as_ptr()) }.to_string_lossy();
+        let net = s.f_flags & libc::MNT_LOCAL as u32 == 0 || ["smbfs", "afpfs", "nfs", "webdav"].contains(&fs.as_ref());
+        let kind = if net { Kind::Network } else { Kind::Local };
+        let b = s.f_bsize as u64;
+        out.push(Drive { root, label: e.file_name().to_string_lossy().into(), kind, total: s.f_blocks * b, free: s.f_bavail * b });
+    }
+    out
+}
+
+/// macOS cloud folders: File Provider mounts in ~/Library/CloudStorage plus iCloud Drive.
+#[cfg(target_os = "macos")]
+fn sync_roots() -> Vec<SyncRoot> {
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    std::fs::read_dir(home.join("Library/CloudStorage"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let mut parts = name.splitn(2, '-'); // "OneDrive-Personal", "GoogleDrive-me@x.com"
+            (pretty_provider(parts.next().unwrap_or_default(), parts.next()), e.path())
+        })
+        .chain([("iCloud Drive".to_string(), home.join("Library/Mobile Documents/com~apple~CloudDocs"))])
+        .filter(|(_, p)| p.is_dir())
+        .map(|(provider, path)| SyncRoot { provider, key: path.to_string_lossy().to_lowercase(), path })
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn known_folders() -> Vec<(&'static str, PathBuf)> {
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    let mut out = vec![("Home", home.clone())];
+    for (label, dir) in [("Desktop", "Desktop"), ("Documents", "Documents"), ("Downloads", "Downloads"), ("Pictures", "Pictures"), ("Music", "Music"), ("Videos", "Movies")] {
+        out.push((label, home.join(dir)));
+    }
+    out
+}
+
 /// Cloud sync folders registered with Windows (OneDrive, Google Drive, Dropbox, iCloud, Box, ...),
 /// plus OneDrive's environment variables as a fallback.
+#[cfg(windows)]
 fn sync_roots() -> Vec<SyncRoot> {
     let mut out: Vec<SyncRoot> = vec![];
     let mut add = |provider: String, path: PathBuf| {
@@ -289,6 +384,7 @@ fn pretty_provider(id: &str, account: Option<&str>) -> String {
     id.into()
 }
 
+#[cfg(windows)]
 fn known_folders() -> Vec<(&'static str, PathBuf)> {
     let key = RegKey::predef(HKEY_CURRENT_USER).open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders");
     let mut out = vec![("Home", PathBuf::from(std::env::var("USERPROFILE").unwrap_or_default()))];
@@ -320,5 +416,9 @@ fn scan_sums_nested_sizes() {
     assert_eq!((d.size, d.dirs[0].size, d.dirs[0].dirs[0].size), (60, 50, 30));
     assert_eq!((d.local, d.files, n.load(Ordering::Relaxed)), (60, 3, 3));
     assert_eq!(acc.exts.lock().unwrap()["txt"], (40, 2));
+    #[cfg(windows)]
     assert_eq!(names_of(Path::new(r"C:\Users\me")), ["C:\\", "Users", "me"]);
+    #[cfg(target_os = "macos")]
+    assert_eq!(names_of(Path::new("/Volumes/USB/a")), ["/Volumes/USB", "a"]);
 }
+

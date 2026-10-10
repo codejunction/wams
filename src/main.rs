@@ -4,17 +4,25 @@
 mod scan;
 mod ui;
 
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
+#[cfg(windows)]
 use std::path::PathBuf;
+#[cfg(windows)]
 use std::process::Command;
+#[cfg(windows)]
 use winreg::RegKey;
+#[cfg(windows)]
 use winreg::enums::HKEY_CURRENT_USER;
 
+#[cfg(windows)]
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+#[cfg(windows)]
 const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\wams";
 
 /// Per-user install: copy to %LOCALAPPDATA%\Programs\wams, run at login, list in Apps & features.
 /// Returns true when this process should exit.
+#[cfg(windows)]
 fn install() -> bool {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--portable") {
@@ -52,6 +60,12 @@ fn install() -> bool {
         let _ = k.set_value("NoModify", &1u32);
     }
     Command::new(&target).spawn().is_ok()
+}
+
+/// macOS: no installer, the binary (or .app bundle) runs where it is.
+#[cfg(not(windows))]
+fn install() -> bool {
+    false
 }
 
 fn main() -> eframe::Result {
