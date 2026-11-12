@@ -24,6 +24,12 @@ pub fn cloud_only(m: &std::fs::Metadata) -> bool {
     m.st_flags() & 0x4000_0000 != 0 // SF_DATALESS
 }
 
+/// Linux and other systems have no online-only placeholder files.
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn cloud_only(_: &std::fs::Metadata) -> bool {
+    false
+}
+
 /// macOS: mount points and firmlink mirrors under "/" that would be counted twice or never finish.
 #[cfg(target_os = "macos")]
 const SKIP: [&str; 5] = ["/Volumes", "/System/Volumes", "/dev", "/net", "/home"];
@@ -55,7 +61,7 @@ impl Drive {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-#[cfg_attr(not(windows), allow(dead_code))] // macOS has no USB/Cloud drive detection
+#[cfg_attr(not(windows), allow(dead_code))] // only Windows detects every kind
 pub enum Kind {
     System,
     Local,
@@ -99,7 +105,7 @@ impl Scan {
     }
 
     pub fn find(&self, path: &Path) -> Option<&Dir> {
-        find(&self.root, &names_of(path))
+        find(&self.root, &names_of(path, &self.drives))
     }
 
     /// The sync root this path is inside of, if any.
@@ -145,6 +151,14 @@ fn scan(path: &Path, name: String, count: &AtomicU64, acc: &Acc) -> Dir {
     #[cfg(target_os = "macos")]
     if path == Path::new("/") {
         subs.retain(|n| !SKIP.iter().any(|s| path.join(n) == Path::new(s)));
+    }
+    // Linux, like `du -x`: /proc, /sys, tmpfs and other mounted drives are not part of this drive
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(dev) = std::fs::metadata(path).map(|m| m.dev()) {
+            subs.retain(|n| std::fs::symlink_metadata(path.join(n)).is_ok_and(|m| m.dev() == dev));
+        }
     }
     count.fetch_add(files, Ordering::Relaxed);
     if !exts.is_empty() {
@@ -210,8 +224,10 @@ fn entries(dir: &Path) -> Vec<Entry> {
         .collect()
 }
 
-/// Path to tree names. The drive comes back as one name ("C:" + "\" = "C:\", or "/Volumes/X" on macOS).
-pub fn names_of(p: &Path) -> Vec<String> {
+/// Path to tree names. The drive comes back as one name ("C:" + "\" = "C:\", "/Volumes/X" on macOS,
+/// the mount point on Linux).
+#[cfg_attr(any(windows, target_os = "macos"), allow(unused_variables))]
+pub fn names_of(p: &Path, drives: &[Drive]) -> Vec<String> {
     let mut f: Vec<String> = p.iter().map(|c| c.to_string_lossy().into()).collect();
     if f.len() >= 2 && f[1] == "\\" {
         let sep = f.remove(1);
@@ -221,6 +237,11 @@ pub fn names_of(p: &Path) -> Vec<String> {
     if f.len() >= 3 && f[0] == "/" && f[1] == "Volumes" {
         let vol = format!("/Volumes/{}", f[2]);
         f.splice(..3, [vol]);
+    }
+    // the deepest mount point that contains the path; "/" is already one name
+    #[cfg(not(any(windows, target_os = "macos")))]
+    if let Some(d) = drives.iter().filter(|d| d.root != "/" && p.starts_with(&d.root)).max_by_key(|d| d.root.len()) {
+        f.splice(..Path::new(&d.root).iter().count(), [d.root.clone()]);
     }
     f
 }
@@ -234,7 +255,7 @@ pub fn find<'a>(root: &'a Dir, names: &[String]) -> Option<&'a Dir> {
 }
 
 #[cfg(windows)]
-fn wide(s: &str) -> Vec<u16> {
+pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain([0]).collect()
 }
 
@@ -306,6 +327,107 @@ fn drives() -> Vec<Drive> {
         let kind = if net { Kind::Network } else { Kind::Local };
         let b = s.f_bsize as u64;
         out.push(Drive { root, label: e.file_name().to_string_lossy().into(), kind, total: s.f_blocks * b, free: s.f_bavail * b });
+    }
+    out
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn home() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_default())
+}
+
+/// /proc/self/mounts writes space, tab, newline and backslash in a path as \040, \011, \012, \134.
+#[cfg(not(any(windows, target_os = "macos")))]
+fn unescape(s: &str) -> String {
+    let (mut out, mut rest) = (String::new(), s);
+    while let Some(i) = rest.find('\\') {
+        out.push_str(&rest[..i]);
+        match rest.get(i + 1..i + 4).and_then(|o| u8::from_str_radix(o, 8).ok()) {
+            Some(b) => {
+                out.push(b as char);
+                rest = &rest[i + 4..];
+            }
+            None => {
+                out.push('\\');
+                rest = &rest[i + 1..];
+            }
+        }
+    }
+    out + rest
+}
+
+/// Linux: every mounted filesystem that sits on a block device, plus network mounts (listed, not walked).
+// ponytail: a dead network mount can make statvfs slow; it runs on the scan thread so the UI stays live
+#[cfg(not(any(windows, target_os = "macos")))]
+fn drives() -> Vec<Drive> {
+    use std::os::unix::fs::MetadataExt;
+    let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap_or_default();
+    let mut found: Vec<(String, bool)> = mounts
+        .lines()
+        .filter_map(|line| {
+            let mut f = line.split(' ');
+            let (dev, root, fs) = (f.next()?, unescape(f.next()?), f.next()?);
+            let net = ["nfs", "nfs4", "cifs", "smb3", "fuse.sshfs", "ceph", "davfs"].contains(&fs);
+            // no block device = pseudo filesystem (proc, tmpfs, overlay); squashfs = snap images; /boot = boot loader files
+            let real = (dev.starts_with("/dev/") || fs == "zfs") && fs != "squashfs" && !root.starts_with("/boot");
+            (net || real).then_some((root, net))
+        })
+        .collect();
+    // "/" first: a second mount of the same filesystem (bind mount) is the copy, not "/"
+    found.sort_by_key(|(root, _)| root.len());
+    let mut seen = std::collections::HashSet::new();
+    found
+        .into_iter()
+        .filter_map(|(root, net)| {
+            if !seen.insert(std::fs::metadata(&root).ok()?.dev()) {
+                return None;
+            }
+            let c = std::ffi::CString::new(root.as_str()).ok()?;
+            let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+            if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
+                return None;
+            }
+            let kind = match root.as_str() {
+                "/" => Kind::System,
+                _ if net => Kind::Network,
+                r if r.starts_with("/media/") || r.starts_with("/run/media/") => Kind::Usb, // where desktops mount removable disks
+                _ => Kind::Local,
+            };
+            let label = if root == "/" { "System".into() } else { Path::new(&root).file_name().map_or(root.clone(), |n| n.to_string_lossy().into()) };
+            let b = s.f_frsize as u64;
+            Some(Drive { root, label, kind, total: s.f_blocks as u64 * b, free: s.f_bavail as u64 * b })
+        })
+        .collect()
+}
+
+/// Linux has no list of sync folders: look for the folders the common sync clients create in the home folder.
+// ponytail: a client set up with another folder name is missed; read each client's config if that matters
+#[cfg(not(any(windows, target_os = "macos")))]
+fn sync_roots() -> Vec<SyncRoot> {
+    ["Dropbox", "OneDrive", "Google Drive", "Nextcloud", "ownCloud", "pCloudDrive", "MEGA", "Insync"]
+        .iter()
+        .map(|name| (pretty_provider(name, None), home().join(name)))
+        .filter(|(_, p)| p.is_dir())
+        .map(|(provider, path)| SyncRoot { provider, key: path.to_string_lossy().to_lowercase(), path })
+        .collect()
+}
+
+/// Linux: XDG user folders, whose names follow the desktop language (~/.config/user-dirs.dirs).
+#[cfg(not(any(windows, target_os = "macos")))]
+fn known_folders() -> Vec<(&'static str, PathBuf)> {
+    let home = home();
+    let config = std::env::var("XDG_CONFIG_HOME").map_or_else(|_| home.join(".config"), PathBuf::from);
+    let dirs = std::fs::read_to_string(config.join("user-dirs.dirs")).unwrap_or_default();
+    let mut out = vec![("Home", home.clone())];
+    for (label, key) in [("Desktop", "DESKTOP"), ("Documents", "DOCUMENTS"), ("Downloads", "DOWNLOAD"), ("Pictures", "PICTURES"), ("Music", "MUSIC"), ("Videos", "VIDEOS")] {
+        let path = match dirs.lines().find_map(|l| l.trim().strip_prefix(&format!("XDG_{key}_DIR="))).map(|v| v.trim_matches('"')) {
+            Some(v) => v.strip_prefix("$HOME/").map_or_else(|| PathBuf::from(v), |rest| home.join(rest)),
+            None => home.join(if key == "DOWNLOAD" { "Downloads" } else { label }),
+        };
+        // a folder switched off in the file points at the home folder itself
+        if path.is_dir() && path != home {
+            out.push((label, path));
+        }
     }
     out
 }
@@ -403,6 +525,13 @@ fn known_folders() -> Vec<(&'static str, PathBuf)> {
     out
 }
 
+#[cfg(all(test, not(any(windows, target_os = "macos"))))]
+fn drives_for_test() -> Vec<Drive> {
+    let mut d = drives();
+    d.sort_by_key(|d| d.root.len());
+    d
+}
+
 #[test]
 fn scan_sums_nested_sizes() {
     let root = std::env::temp_dir().join("wams_test");
@@ -417,8 +546,20 @@ fn scan_sums_nested_sizes() {
     assert_eq!((d.local, d.files, n.load(Ordering::Relaxed)), (60, 3, 3));
     assert_eq!(acc.exts.lock().unwrap()["txt"], (40, 2));
     #[cfg(windows)]
-    assert_eq!(names_of(Path::new(r"C:\Users\me")), ["C:\\", "Users", "me"]);
+    assert_eq!(names_of(Path::new(r"C:\Users\me"), &[]), ["C:\\", "Users", "me"]);
     #[cfg(target_os = "macos")]
-    assert_eq!(names_of(Path::new("/Volumes/USB/a")), ["/Volumes/USB", "a"]);
+    assert_eq!(names_of(Path::new("/Volumes/USB/a"), &[]), ["/Volumes/USB", "a"]);
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let drive = |root: &str| Drive { root: root.into(), label: String::new(), kind: Kind::Local, total: 0, free: 0 };
+        let drives = [drive("/"), drive("/media/me/USB DISK"), drive("/media")];
+        assert_eq!(names_of(Path::new("/media/me/USB DISK/a"), &drives), ["/media/me/USB DISK", "a"]);
+        assert_eq!(names_of(Path::new("/usr/bin"), &drives), ["/", "usr", "bin"]);
+        assert_eq!(unescape(r"/media/me/USB\040DISK\134x\zz"), r"/media/me/USB DISK\x\zz");
+        // the real mount table of this machine: "/" is there, has a size, and comes back once
+        let real = drives_for_test();
+        assert_eq!(real.iter().filter(|d| d.root == "/").count(), 1);
+        assert!(real.iter().all(|d| d.total >= d.free) && real[0].total > 0, "{}", real.len());
+    }
 }
 

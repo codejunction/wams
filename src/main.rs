@@ -2,6 +2,7 @@
 //! wams - who ate my storage. Folder/file sizes for every drive.
 
 mod scan;
+mod tasks;
 mod ui;
 
 #[cfg(windows)]

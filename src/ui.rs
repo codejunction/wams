@@ -1,6 +1,7 @@
-//! Theme, layout and the three views (Explorer, Disk analysis, Cloud backup).
+//! Theme, layout and the four views (Explorer, Disk analysis, Cloud backup, Task manager).
 
 use crate::scan::{self, Dir, Kind, Scan};
+use crate::tasks::{self, Cmd, Group, Proc, Snapshot, Use};
 use eframe::egui::{
     self, Align2, Color32, CursorIcon, FontFamily, FontId, Margin, Rect, RichText, Sense, Stroke, Ui, pos2, vec2,
 };
@@ -8,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant};
 
 /// Segoe Fluent Icons / MDL2 Assets code points (loaded from C:\Windows\Fonts).
 #[cfg(windows)]
@@ -35,9 +37,11 @@ mod icon {
     pub const COPY: &str = "\u{E8C8}";
     pub const OPEN: &str = "\u{E8A7}";
     pub const UP: &str = "\u{E74A}";
+    pub const TASKS: &str = "\u{E9D9}";
+    pub const KILL: &str = "\u{E711}";
 }
 
-/// macOS: glyphs from egui's bundled emoji-icon-font / Noto Emoji.
+/// macOS and Linux: glyphs from egui's bundled emoji-icon-font / Noto Emoji.
 #[cfg(not(windows))]
 mod icon {
     pub const FOLDER: &str = "🗀";
@@ -63,7 +67,18 @@ mod icon {
     pub const COPY: &str = "🗐";
     pub const OPEN: &str = "⮫";
     pub const UP: &str = "⬆";
+    pub const TASKS: &str = "📊";
+    pub const KILL: &str = "✖";
 }
+
+/// Menu label for "reveal this in the system file manager".
+const SHOW: &str = if cfg!(windows) {
+    "Show in Explorer"
+} else if cfg!(target_os = "macos") {
+    "Show in Finder"
+} else {
+    "Show in file manager"
+};
 
 const ROW_H: f32 = 24.0;
 const FOLDER_GREY: Color32 = Color32::from_rgb(128, 128, 128);
@@ -131,7 +146,7 @@ fn semibold(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name("semibold".into()))
 }
 
-/// System UI font (Segoe UI / SF Pro) + Segoe Fluent Icons on Windows, egui's bundled fonts as fallback.
+/// System UI font (Segoe UI / SF Pro) + Segoe Fluent Icons on Windows, egui's bundled fonts as fallback (always on Linux).
 fn load_fonts(ctx: &egui::Context) {
     #[cfg(windows)]
     let (dir, ui, icons, semi): (PathBuf, &[&str], &[&str], &[&str]) = (
@@ -285,6 +300,56 @@ enum View {
     Explorer,
     Analysis,
     Cloud,
+    Tasks,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum Col {
+    Name,
+    Cpu,
+    Mem,
+    Gpu,
+    Disk,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum Filter {
+    All,
+    Apps,
+    System,
+}
+
+const COLS: [(Col, &str); 4] = [(Col::Cpu, "CPU"), (Col::Mem, "Memory"), (Col::Gpu, "GPU"), (Col::Disk, "Disk")];
+const SAMPLE_EVERY: Duration = Duration::from_millis(1500);
+
+/// Right edge of metric column `i` in a task row.
+fn col_right(row: Rect, i: usize) -> f32 {
+    row.right() - 12.0 - (COLS.len() - 1 - i) as f32 * 92.0
+}
+
+/// Text and 0..1 intensity of one metric.
+fn cell(col: Col, u: &Use, s: &Snapshot) -> (String, f32) {
+    match col {
+        Col::Name => (String::new(), 0.0),
+        Col::Cpu => (format!("{:.1}%", u.cpu), u.cpu / 100.0),
+        Col::Mem => (human(u.mem), u.mem as f32 / s.mem_total.max(1) as f32),
+        Col::Gpu if !s.has_gpu => ("n/a".into(), 0.0),
+        Col::Gpu => (format!("{:.0}%", u.gpu), u.gpu / 100.0),
+        // full intensity at 100 MB/s
+        Col::Disk => (format!("{}/s", human(u.disk)), u.disk as f32 / (100u64 << 20) as f32),
+    }
+}
+
+/// Biggest user first; names A to Z.
+fn by_col(col: Col, a: (&str, &Use), b: (&str, &Use)) -> std::cmp::Ordering {
+    match col {
+        Col::Name => std::cmp::Ordering::Equal,
+        Col::Cpu => b.1.cpu.total_cmp(&a.1.cpu),
+        Col::Mem => b.1.mem.cmp(&a.1.mem),
+        Col::Gpu => b.1.gpu.total_cmp(&a.1.gpu),
+        Col::Disk => b.1.disk.cmp(&a.1.disk),
+    }
+    .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
 }
 
 struct Row {
@@ -309,6 +374,13 @@ enum Act {
     Refresh,
     Show(PathBuf, bool),
     Copy(String),
+    Sort(Col),
+    Filter(Filter),
+    Open(String),
+    Pick(String, Option<u32>),
+    /// First click on "End task" for a system process: ask again.
+    Arm,
+    Kill(Vec<u32>),
 }
 
 type FileCache = HashMap<PathBuf, Vec<(String, u64, bool)>>;
@@ -341,8 +413,16 @@ fn show_in_explorer(p: &Path, dir: bool) {
     let _ = std::process::Command::new("explorer").raw_arg(arg).spawn();
 }
 
+/// Linux: open the folder, or the folder that holds the file.
+// ponytail: the file is not selected; org.freedesktop.FileManager1.ShowItems over D-Bus does that
+#[cfg(not(any(windows, target_os = "macos")))]
+fn show_in_explorer(p: &Path, dir: bool) {
+    let folder = if dir { Some(p) } else { p.parent() };
+    let _ = std::process::Command::new("xdg-open").arg(folder.unwrap_or(p)).spawn();
+}
+
 /// Finder: open the folder, or reveal the file.
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 fn show_in_explorer(p: &Path, dir: bool) {
     let _ = std::process::Command::new("open").args(if dir { &[][..] } else { &["-R"][..] }).arg(p).spawn();
 }
@@ -380,7 +460,7 @@ fn drive_name(d: &scan::Drive) -> String {
     format!("{} ({})", d.label, d.root.trim_end_matches('\\'))
 }
 
-/// Scanned drives open in the tree; network and cloud drives open in Windows Explorer.
+/// Scanned drives open in the tree; network and cloud drives open in the system file manager.
 fn open_drive(d: &scan::Drive) -> Act {
     if d.scanned() { Act::Focus(d.root.clone().into()) } else { Act::Show(d.root.clone().into(), true) }
 }
@@ -395,6 +475,14 @@ fn bar(ui: &Ui, rect: Rect, frac: f32, fill: Color32, track: Color32) {
 
 fn text(ui: &Ui, pos: egui::Pos2, align: Align2, s: &str, font: FontId, color: Color32) -> Rect {
     ui.painter().text(pos, align, s, font, color)
+}
+
+/// Key on the left, value on the right.
+fn kv(ui: &mut Ui, p: &Pal, k: &str, v: String) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(k).color(p.weak));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(RichText::new(v).color(p.text)));
+    });
 }
 
 fn section(ui: &mut Ui, p: &Pal, title: &str) {
@@ -444,6 +532,21 @@ pub struct App {
     dirty: bool,
     selected: Option<PathBuf>,
     accent: Color32,
+    tasks: Option<Snapshot>,
+    task_tx: mpsc::Sender<Cmd>,
+    task_rx: mpsc::Receiver<Snapshot>,
+    /// A sample is on its way.
+    task_wait: bool,
+    task_at: Instant,
+    /// Fast samples left: CPU and disk rates need two samples before they mean anything.
+    task_quick: u8,
+    task_sort: Col,
+    task_filter: Filter,
+    task_open: HashSet<String>,
+    /// Group name, and a pid when one sub-task is selected.
+    task_sel: Option<(String, Option<u32>)>,
+    task_armed: bool,
+    task_error: Option<String>,
 }
 
 impl App {
@@ -452,6 +555,7 @@ impl App {
         let accent = ACCENT;
         apply_theme(ctx, accent);
         ctx.set_theme(egui::Theme::Dark);
+        let (task_tx, task_rx) = tasks::spawn(ctx.clone());
         let mut app = App {
             scan: None,
             rx: None,
@@ -464,6 +568,18 @@ impl App {
             dirty: false,
             selected: None,
             accent,
+            tasks: None,
+            task_tx,
+            task_rx,
+            task_wait: false,
+            task_at: Instant::now(),
+            task_quick: 0,
+            task_sort: Col::Cpu,
+            task_filter: Filter::All,
+            task_open: HashSet::new(),
+            task_sel: None,
+            task_armed: false,
+            task_error: None,
         };
         app.refresh();
         app
@@ -505,7 +621,7 @@ impl App {
             });
         });
         ui.add_space(14.0);
-        for (v, ic, label) in [(View::Explorer, icon::EXPLORER, "Explorer"), (View::Analysis, icon::PIE, "Disk analysis"), (View::Cloud, icon::CLOUD, "Cloud backup")] {
+        for (v, ic, label) in [(View::Explorer, icon::EXPLORER, "Explorer"), (View::Analysis, icon::PIE, "Disk analysis"), (View::Cloud, icon::CLOUD, "Cloud backup"), (View::Tasks, icon::TASKS, "Task manager")] {
             if nav_item(ui, p, ic, label, self.view == v).clicked() {
                 acts.push(Act::View(v));
             }
@@ -560,7 +676,7 @@ impl App {
     fn header(&self, ui: &mut Ui, p: &Pal, acts: &mut Vec<Act>) {
         let s = self.scan.as_ref().unwrap();
         ui.horizontal(|ui| {
-            let names = scan::names_of(&self.focus);
+            let names = scan::names_of(&self.focus, &s.drives);
             let up = egui::Button::new(RichText::new(icon::UP).size(14.0)).min_size(vec2(32.0, 32.0));
             if ui.add_enabled(!names.is_empty(), up).on_hover_text("Up one level").clicked() {
                 acts.push(Act::Focus(names[..names.len() - 1].iter().collect()));
@@ -684,7 +800,7 @@ impl App {
         if dir && ui.button(format!("{}   Open", icon::FOLDER_OPEN)).clicked() {
             acts.push(Act::Focus(path.into()));
         }
-        if ui.button(format!("{}   Show in Explorer", icon::OPEN)).clicked() {
+        if ui.button(format!("{}   {SHOW}", icon::OPEN)).clicked() {
             acts.push(Act::Show(path.into(), dir));
         }
         if ui.button(format!("{}   Copy path", icon::COPY)).clicked() {
@@ -963,12 +1079,7 @@ impl App {
             ui.add_space(12.0);
             card(p).inner_margin(12.0).show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
-                let prop = |ui: &mut Ui, k: &str, v: String| {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(k).color(p.weak));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(RichText::new(v).color(p.text)));
-                    });
-                };
+                let prop = |ui: &mut Ui, k: &str, v: String| kv(ui, p, k, v);
                 if let Some(d) = drive {
                     prop(ui, "Type", format!("{} drive", d.kind.name()));
                     prop(ui, "Capacity", human(d.total));
@@ -1015,13 +1126,256 @@ impl App {
                 if dir.is_some() && ui.add(egui::Button::new(format!("{}   Open", icon::FOLDER_OPEN)).min_size(w)).clicked() {
                     acts.push(Act::Focus(target.clone()));
                 }
-                if ui.add(egui::Button::new(format!("{}   Show in Explorer", icon::OPEN)).min_size(w)).clicked() {
+                if ui.add(egui::Button::new(format!("{}   {SHOW}", icon::OPEN)).min_size(w)).clicked() {
                     acts.push(Act::Show(target.clone(), dir.is_some()));
                 }
                 if ui.add(egui::Button::new(format!("{}   Copy path", icon::COPY)).min_size(w)).clicked() {
                     acts.push(Act::Copy(target.display().to_string()));
                 }
             }
+        });
+    }
+
+    fn sort_tasks(&mut self) {
+        let col = self.task_sort;
+        let Some(s) = &mut self.tasks else { return };
+        s.groups.sort_by(|a, b| by_col(col, (&a.name, &a.used), (&b.name, &b.used)));
+        for g in &mut s.groups {
+            // pid last: equal rows must not swap places between samples
+            g.procs.sort_by(|a, b| by_col(col, (&a.name, &a.used), (&b.name, &b.used)).then(a.pid.cmp(&b.pid)));
+        }
+    }
+
+    /// Receives samples and asks for the next one. Only called while the task view is on screen.
+    fn poll_tasks(&mut self, ctx: &egui::Context) {
+        match self.task_rx.try_recv() {
+            Ok(mut s) => {
+                if let Some(e) = s.error.take() {
+                    self.task_error = Some(e);
+                }
+                self.tasks = Some(s);
+                self.task_wait = false;
+                self.task_at = Instant::now();
+                self.task_quick = self.task_quick.saturating_sub(1);
+                self.sort_tasks();
+            }
+            Err(mpsc::TryRecvError::Disconnected) => self.task_error = Some("Process information is not available on this system.".into()),
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        if self.task_wait {
+            return; // the sampler thread repaints when it answers
+        }
+        let due = if self.task_quick > 0 { Duration::from_millis(300) } else { SAMPLE_EVERY };
+        let age = self.task_at.elapsed();
+        if self.tasks.is_none() || age >= due {
+            self.task_wait = self.task_tx.send(Cmd::Sample).is_ok();
+        } else {
+            ctx.request_repaint_after(due - age);
+        }
+    }
+
+    /// The selected app, and the selected sub-task if there is one.
+    fn picked(&self) -> Option<(&Group, Option<&Proc>)> {
+        let (name, pid) = self.task_sel.as_ref()?;
+        let g = self.tasks.as_ref()?.groups.iter().find(|g| g.name == *name)?;
+        match pid {
+            Some(pid) => Some((g, Some(g.procs.iter().find(|x| x.pid == *pid)?))),
+            None => Some((g, None)),
+        }
+    }
+
+    fn tasks_view(&self, ui: &mut Ui, p: &Pal, acts: &mut Vec<Act>) {
+        let Some(s) = &self.tasks else {
+            ui.vertical_centered(|ui| {
+                ui.add_space(ui.available_height() / 2.0 - 40.0);
+                match &self.task_error {
+                    Some(e) => ui.label(RichText::new(format!("{}  {e}", icon::WARN)).color(p.warn)),
+                    None => ui.add(egui::Spinner::new().size(36.0).color(p.accent)),
+                };
+            });
+            return;
+        };
+        ui.horizontal(|ui| {
+            ui.heading("Who ate my resources");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                for (f, label) in [(Filter::System, "System"), (Filter::Apps, "Apps"), (Filter::All, "All")] {
+                    if ui.selectable_label(self.task_filter == f, label).clicked() {
+                        acts.push(Act::Filter(f));
+                    }
+                }
+            });
+        });
+        if let Some(e) = &self.task_error {
+            ui.label(RichText::new(format!("{}  {e}", icon::WARN)).color(p.warn));
+        }
+        ui.add_space(8.0);
+        ui.spacing_mut().item_spacing.x = 12.0;
+        ui.columns(COLS.len(), |c| {
+            for (ui, (col, label)) in c.iter_mut().zip(COLS) {
+                let (value, frac) = cell(col, &s.total, s);
+                let top = s.groups.iter().min_by(|a, b| by_col(col, (&a.name, &a.used), (&b.name, &b.used))).filter(|g| cell(col, &g.used, s).1 > 0.0);
+                card(p).inner_margin(12.0).show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    let label = if col == Col::Mem { format!("Memory · {} total", human(s.mem_total)) } else { label.to_string() };
+                    ui.add(egui::Label::new(RichText::new(label).size(12.0).color(p.weak)).truncate());
+                    ui.label(RichText::new(value).font(semibold(22.0)).color(p.text));
+                    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 5.0), Sense::hover());
+                    bar(ui, rect, frac, if frac > 0.9 { p.warn } else { p.accent }, p.track);
+                    let top = top.map_or_else(|| "Nothing using it".to_string(), |g| format!("Top: {}", g.name));
+                    ui.add(egui::Label::new(RichText::new(top).size(12.0).color(p.weak)).truncate());
+                });
+            }
+        });
+        ui.add_space(10.0);
+        let (head, _) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
+        let y = head.center().y;
+        let mut head_cell = |col: Col, label: &str, pos: egui::Pos2, align: Align2| {
+            let color = if self.task_sort == col { p.accent } else { p.weak };
+            let r = text(ui, pos, align, label, FontId::proportional(12.5), color);
+            let resp = ui.interact(r.expand2(vec2(10.0, 8.0)), ui.id().with(("sort", label)), Sense::click());
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("Sort by {label}")));
+            if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                acts.push(Act::Sort(col));
+            }
+        };
+        head_cell(Col::Name, "Name", pos2(head.left() + 38.0, y), Align2::LEFT_CENTER);
+        for (i, (col, label)) in COLS.into_iter().enumerate() {
+            head_cell(col, label, pos2(col_right(head, i) - 8.0, y), Align2::RIGHT_CENTER);
+        }
+        ui.painter().hline(head.x_range(), head.bottom(), Stroke::new(1.0, p.stroke));
+
+        let mut rows: Vec<(&Group, Option<&Proc>)> = vec![];
+        for g in &s.groups {
+            if self.task_filter == Filter::All || (self.task_filter == Filter::System) == g.system {
+                rows.push((g, None));
+                if g.procs.len() > 1 && self.task_open.contains(&g.name) {
+                    rows.extend(g.procs.iter().map(|x| (g, Some(x))));
+                }
+            }
+        }
+        ui.spacing_mut().item_spacing.y = 0.0;
+        egui::ScrollArea::vertical().auto_shrink(false).show_rows(ui, ROW_H, rows.len(), |ui, range| {
+            for i in range {
+                self.task_row(ui, p, s, rows[i].0, rows[i].1, i, acts);
+            }
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn task_row(&self, ui: &mut Ui, p: &Pal, s: &Snapshot, g: &Group, pr: Option<&Proc>, idx: usize, acts: &mut Vec<Act>) {
+        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
+        let (name, used) = pr.map_or((&g.name, &g.used), |x| (&x.name, &x.used));
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("{name}, CPU {:.1}%, memory {}", used.cpu, human(used.mem))));
+        let sel = self.task_sel.as_ref().is_some_and(|(n, pid)| *n == g.name && *pid == pr.map(|x| x.pid));
+        let bg = if sel { p.accent } else if resp.hovered() { p.hover } else if idx % 2 == 1 { p.nav.gamma_multiply(0.6) } else { Color32::TRANSPARENT };
+        ui.painter().rect_filled(rect, 0.0, bg);
+        let (fg, weak) = if sel { (Color32::WHITE, Color32::WHITE) } else { (p.text, p.weak) };
+        let y = rect.center().y;
+        let x = rect.left() + 16.0 + if pr.is_some() { 20.0 } else { 0.0 };
+        let arrow = Rect::from_min_max(pos2(x - 6.0, rect.top()), pos2(x + 18.0, rect.bottom()));
+        let many = pr.is_none() && g.procs.len() > 1;
+        if many {
+            let a = if self.task_open.contains(&g.name) { icon::DOWN } else { icon::RIGHT };
+            text(ui, pos2(x + 6.0, y), Align2::CENTER_CENTER, a, FontId::proportional(10.0), weak);
+        }
+        let clip = Rect::from_x_y_ranges(x + 22.0..=col_right(rect, 0) - 96.0, rect.y_range());
+        let pt = ui.painter().with_clip_rect(clip);
+        let nr = pt.text(pos2(x + 22.0, y), Align2::LEFT_CENTER, name, FontId::proportional(13.0), fg);
+        let note = match pr {
+            Some(x) => format!("PID {}", x.pid),
+            None if many => format!("{} processes", g.procs.len()),
+            None => String::new(),
+        };
+        let note = pt.text(pos2(nr.right() + 8.0, y), Align2::LEFT_CENTER, note, FontId::proportional(11.5), weak);
+        if pr.is_none() && g.system && note.right() + 70.0 < clip.right() {
+            pill(ui, pos2(note.right() + 8.0, y), "System", if sel { fg } else { p.accent });
+        }
+        for (i, (col, _)) in COLS.into_iter().enumerate() {
+            let (v, frac) = cell(col, used, s);
+            let edge = col_right(rect, i);
+            if !sel && frac > 0.01 {
+                // heat: the busier the cell, the stronger the tint
+                let heat = Rect::from_min_max(pos2(edge - 88.0, rect.top() + 1.0), pos2(edge, rect.bottom() - 1.0));
+                ui.painter().rect_filled(heat, 3.0, p.accent.gamma_multiply(0.06 + 0.5 * frac.min(1.0)));
+            }
+            text(ui, pos2(edge - 8.0, y), Align2::RIGHT_CENTER, &v, FontId::proportional(13.0), if frac > 0.001 { fg } else { weak });
+        }
+        let pick = Act::Pick(g.name.clone(), pr.map(|x| x.pid));
+        if resp.clicked() {
+            let on_arrow = resp.interact_pointer_pos().is_some_and(|q| arrow.contains(q));
+            acts.push(if many && (on_arrow || resp.double_clicked()) { Act::Open(g.name.clone()) } else { pick });
+        } else if resp.secondary_clicked() {
+            acts.push(pick);
+        }
+        // rows reorder with every sample, so the menu acts on the selection, never on "the row under the mouse"
+        resp.context_menu(|ui| self.task_actions(ui, p, false, acts));
+    }
+
+    /// End task / show in file manager / copy path for the selection. Shared by the details pane and the row menu.
+    fn task_actions(&self, ui: &mut Ui, p: &Pal, wide: bool, acts: &mut Vec<Act>) {
+        let Some((g, pr)) = self.picked() else { return };
+        let size = if wide { vec2(ui.available_width(), 32.0) } else { vec2(0.0, 0.0) };
+        let red = TILE_COLORS[6];
+        let end = |label: &str| egui::Button::new(RichText::new(format!("{}   {label}", icon::KILL)).color(red)).min_size(size);
+        if g.system && !self.task_armed {
+            if ui.add(end("End task")).clicked() {
+                acts.push(Act::Arm);
+            }
+        } else {
+            if g.system {
+                ui.add(egui::Label::new(RichText::new(format!("{}  This is part of the system. Ending it can freeze or restart this computer.", icon::WARN)).color(p.warn)).wrap());
+            }
+            if ui.add(end(if g.system { "End it anyway" } else { "End task" })).on_hover_text("Unsaved work in this app is lost").clicked() {
+                acts.push(Act::Kill(pr.map_or_else(|| g.procs.iter().map(|x| x.pid).collect(), |x| vec![x.pid])));
+            }
+        }
+        let exe = pr.map_or_else(|| g.procs.iter().map(|x| &x.exe).find(|e| !e.as_os_str().is_empty()), |x| Some(&x.exe));
+        if let Some(exe) = exe.filter(|e| !e.as_os_str().is_empty()) {
+            if ui.add(egui::Button::new(format!("{}   {SHOW}", icon::OPEN)).min_size(size)).clicked() {
+                acts.push(Act::Show(exe.clone(), false));
+            }
+            if ui.add(egui::Button::new(format!("{}   Copy path", icon::COPY)).min_size(size)).clicked() {
+                acts.push(Act::Copy(exe.display().to_string()));
+            }
+        }
+    }
+
+    fn task_details(&self, ui: &mut Ui, p: &Pal, acts: &mut Vec<Act>) {
+        let (Some(s), Some((g, pr))) = (&self.tasks, self.picked()) else {
+            ui.label(RichText::new("Select an app to see what it uses.").color(p.weak));
+            return;
+        };
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            ui.add_space(8.0);
+            ui.label(RichText::new(icon::TASKS).size(44.0).color(p.accent));
+            ui.add_space(4.0);
+            let (name, used) = pr.map_or((&g.name, &g.used), |x| (&x.name, &x.used));
+            ui.add(egui::Label::new(RichText::new(name).font(semibold(20.0)).color(p.text)).wrap());
+            if let Some(x) = pr.filter(|x| !x.exe.as_os_str().is_empty()) {
+                ui.add(egui::Label::new(RichText::new(x.exe.display().to_string()).size(12.0).color(p.weak)).wrap());
+            }
+            ui.add_space(6.0);
+            if g.system {
+                badge(ui, "Part of the system", p.accent);
+            } else {
+                badge(ui, "App", p.ok);
+            }
+            ui.add_space(12.0);
+            card(p).inner_margin(12.0).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                match pr {
+                    Some(x) => {
+                        kv(ui, p, "PID", x.pid.to_string());
+                        kv(ui, p, "Part of", g.name.clone());
+                    }
+                    None => kv(ui, p, "Processes", num(g.procs.len() as u64)),
+                }
+                for (col, label) in COLS {
+                    kv(ui, p, label, cell(col, used, s).0);
+                }
+            });
+            ui.add_space(12.0);
+            self.task_actions(ui, p, true, acts);
         });
     }
 
@@ -1073,15 +1427,22 @@ impl eframe::App for App {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
 
+        if self.view == View::Tasks {
+            self.poll_tasks(&ctx);
+        }
+
         let p = pal(ctx.theme() == egui::Theme::Dark, self.accent);
         let mut acts = vec![];
         let side = |m: i8| egui::Frame::new().fill(p.nav).inner_margin(Margin::same(m));
         egui::Panel::left("nav").exact_size(252.0).resizable(false).show_separator_line(false).frame(side(12)).show(root, |ui| self.nav(ui, &p, &mut acts));
-        egui::Panel::right("details").exact_size(300.0).resizable(false).show_separator_line(false).frame(side(16)).show(root, |ui| self.details(ui, &p, &mut acts));
+        egui::Panel::right("details").exact_size(300.0).resizable(false).show_separator_line(false).frame(side(16)).show(root, |ui| {
+            if self.view == View::Tasks { self.task_details(ui, &p, &mut acts) } else { self.details(ui, &p, &mut acts) }
+        });
         egui::CentralPanel::default().frame(egui::Frame::new().fill(p.content)).show(root, |ui| {
             egui::Frame::new().inner_margin(16.0).show(ui, |ui| {
                 ui.set_min_size(ui.available_size());
                 match (&self.scan, self.view) {
+                    (_, View::Tasks) => self.tasks_view(ui, &p, &mut acts),
                     (None, _) => self.loading(ui, &p),
                     (_, View::Explorer) => self.explorer_view(ui, &p, &mut acts),
                     (_, View::Analysis) => self.analysis_view(ui, &p, &mut acts),
@@ -1109,11 +1470,35 @@ impl eframe::App for App {
                     self.dirty = true;
                 }
                 Act::Select(path) => self.selected = Some(path),
-                Act::View(v) => self.view = v,
+                Act::View(v) => {
+                    self.view = v;
+                    self.task_quick = 2;
+                }
                 Act::Refresh if self.rx.is_none() => self.refresh(),
                 Act::Refresh => {}
                 Act::Show(path, dir) => show_in_explorer(&path, dir),
                 Act::Copy(s) => ctx.copy_text(s),
+                Act::Sort(c) => {
+                    self.task_sort = c;
+                    self.sort_tasks();
+                }
+                Act::Filter(f) => self.task_filter = f,
+                Act::Open(name) => {
+                    if !self.task_open.remove(&name) {
+                        self.task_open.insert(name);
+                    }
+                }
+                Act::Pick(name, pid) => {
+                    self.task_sel = Some((name, pid));
+                    self.task_armed = false;
+                    self.task_error = None;
+                }
+                Act::Arm => self.task_armed = true,
+                Act::Kill(pids) => {
+                    self.task_wait = self.task_tx.send(Cmd::Kill(pids)).is_ok();
+                    self.task_armed = false;
+                    self.task_error = None;
+                }
             }
         }
     }
