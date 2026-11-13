@@ -117,8 +117,8 @@ fn pal(dark: bool, accent: Color32) -> Pal {
         Pal {
             nav: c(19, 19, 19),
             content: c(28, 28, 30),
-            card: c(28, 28, 30),
-            stroke: c(44, 44, 46),
+            card: c(34, 34, 37),
+            stroke: c(48, 48, 52),
             hover: c(44, 44, 46),
             track: c(44, 44, 46),
             text: c(229, 229, 234),
@@ -443,6 +443,60 @@ fn card(p: &Pal) -> egui::Frame {
     egui::Frame::new().fill(p.card).stroke(Stroke::new(1.0, p.stroke)).corner_radius(8.0).inner_margin(16.0)
 }
 
+/// Rounded search field: icon, text, clear button; Esc clears. Returns the new text when it changed,
+/// and whether Enter was pressed.
+fn search_box(ui: &mut Ui, p: &Pal, key: &str, value: &str, hint: &str, width: f32) -> (Option<String>, bool) {
+    let id = ui.id().with(key);
+    let focused = ui.memory(|m| m.has_focus(id));
+    let (mut q, mut changed, mut enter) = (value.to_string(), false, false);
+    let ring = if focused { Stroke::new(1.5, p.accent) } else { Stroke::new(1.0, p.stroke) };
+    egui::Frame::new().fill(p.nav).stroke(ring).corner_radius(8.0).inner_margin(Margin::symmetric(10, 6)).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.label(RichText::new(icon::SEARCH).size(13.0).color(if focused { p.accent } else { p.weak }));
+            // fixed width: margins 20, icon and gap 22, clear button 26
+            let room = width - 42.0 - if q.is_empty() { 0.0 } else { 26.0 };
+            let edit = egui::TextEdit::singleline(&mut q).id(id).frame(egui::Frame::NONE).margin(vec2(0.0, 2.0)).desired_width(room);
+            let r = ui.add(edit.hint_text(RichText::new(hint).color(p.weak)));
+            changed |= r.changed();
+            enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let esc = (r.has_focus() || r.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Escape));
+            let x = !q.is_empty() && ui.add(egui::Button::new(RichText::new(icon::KILL).size(10.0).color(p.weak)).frame(false)).on_hover_text("Clear").clicked();
+            if (esc || x) && !q.is_empty() {
+                q.clear();
+                changed = true;
+            }
+        });
+    });
+    (changed.then_some(q), enter)
+}
+
+/// Segmented switch; returns the item clicked.
+fn segmented<T: PartialEq + Copy>(ui: &mut Ui, p: &Pal, items: &[(T, &str)], current: T) -> Option<T> {
+    let mut out = None;
+    egui::Frame::new().fill(p.nav).stroke(Stroke::new(1.0, p.stroke)).corner_radius(8.0).inner_margin(3.0).show(ui, |ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        // a right-to-left parent lays the buttons out backwards: reverse them so they read left to right
+        let rtl = ui.layout().prefer_right_to_left();
+        ui.horizontal(|ui| {
+            for &(v, label) in items.iter().rev().filter(|_| rtl).chain(items.iter().filter(|_| !rtl)) {
+                let on = v == current;
+                let t = RichText::new(label).color(if on { Color32::WHITE } else { p.weak });
+                let b = egui::Button::new(t).fill(if on { p.accent } else { Color32::TRANSPARENT }).stroke(Stroke::NONE).corner_radius(6.0).min_size(vec2(64.0, 30.0));
+                if ui.add(b).clicked() {
+                    out = Some(v);
+                }
+            }
+        });
+    });
+    out
+}
+
+/// Card that holds a table; rows run edge to edge.
+fn table(p: &Pal) -> egui::Frame {
+    card(p).inner_margin(Margin::same(4))
+}
+
 fn badge(ui: &mut Ui, text: &str, color: Color32) {
     egui::Frame::new().fill(color.gamma_multiply(0.15)).corner_radius(10.0).inner_margin(Margin::symmetric(8, 3)).show(ui, |ui| {
         ui.label(RichText::new(text).color(color).size(12.0));
@@ -510,6 +564,9 @@ fn nav_item(ui: &mut Ui, p: &Pal, icon: &str, label: &str, active: bool) -> egui
     let bg = if active || resp.hovered() { p.hover } else { Color32::TRANSPARENT };
     ui.painter().rect_filled(rect, 6.0, bg);
     let y = rect.center().y;
+    if active {
+        ui.painter().rect_filled(Rect::from_center_size(pos2(rect.left() + 2.0, y), vec2(3.0, 14.0)), 1.5, p.accent);
+    }
     text(ui, pos2(rect.left() + 10.0, y), Align2::LEFT_CENTER, icon, FontId::proportional(14.0), p.text);
     text(ui, pos2(rect.left() + 34.0, y), Align2::LEFT_CENTER, label, FontId::proportional(13.0), p.text);
     resp.on_hover_cursor(CursorIcon::PointingHand)
@@ -787,30 +844,28 @@ impl App {
 
     fn search_bar(&self, ui: &mut Ui, p: &Pal, acts: &mut Vec<Act>) {
         ui.horizontal(|ui| {
-            let mut q = self.search.clone();
             let place = if self.focus.as_os_str().is_empty() { "This PC".into() } else { display_name(&self.focus) };
-            let hint = format!("{}  Search files in {place}, press Enter", icon::SEARCH);
-            let r = ui.add(egui::TextEdit::singleline(&mut q).hint_text(hint).desired_width(360.0));
-            if r.changed() {
+            let (q, enter) = search_box(ui, p, "file_search", &self.search, &format!("Search files in {place}, press Enter"), 380.0);
+            if let Some(q) = q {
+                if q.is_empty() {
+                    acts.push(Act::ClearSearch);
+                }
                 acts.push(Act::Search(q));
             }
-            if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            if enter {
                 acts.push(Act::RunSearch);
             }
             if self.searched.is_some() {
-                if ui.button("Clear").clicked() {
-                    acts.push(Act::ClearSearch);
-                }
-                let n = self.found.len();
-                let status = match (self.found_rx.is_some(), n) {
-                    (true, _) => format!("Searching… {} found", num(n as u64)),
-                    (false, MAX_FOUND) => format!("First {} results, type more to narrow it down", num(n as u64)),
-                    (false, _) => format!("{} found", num(n as u64)),
-                };
+                ui.add_space(4.0);
+                let n = num(self.found.len() as u64);
                 if self.found_rx.is_some() {
                     ui.add(egui::Spinner::new().size(14.0).color(p.accent));
+                    ui.label(RichText::new(format!("Searching… {n} found")).color(p.weak));
+                } else if self.found.len() == MAX_FOUND {
+                    ui.label(RichText::new(format!("First {n} results, type more to narrow it down")).color(p.weak));
+                } else {
+                    badge(ui, &format!("{n} found"), p.accent);
                 }
-                ui.label(RichText::new(status).color(p.weak));
             }
         });
     }
@@ -819,8 +874,8 @@ impl App {
         self.header(ui, p, acts);
         ui.add_space(8.0);
         self.search_bar(ui, p, acts);
-        ui.add_space(8.0);
-        egui::Frame::new().show(ui, |ui| {
+        ui.add_space(10.0);
+        table(p).show(ui, |ui| {
             ui.set_min_size(ui.available_size());
             let (head, _) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
             let (y, r, l) = (head.center().y, head.right(), head.left() + 16.0);
@@ -1327,18 +1382,6 @@ impl App {
         };
         ui.horizontal(|ui| {
             ui.heading("Who ate my resources");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                for (f, label) in [(Filter::System, "System"), (Filter::Apps, "Apps"), (Filter::All, "All")] {
-                    if ui.selectable_label(self.task_filter == f, label).clicked() {
-                        acts.push(Act::Filter(f));
-                    }
-                }
-                let mut q = self.task_query.clone();
-                let hint = format!("{}  Search apps and tasks", icon::SEARCH);
-                if ui.add(egui::TextEdit::singleline(&mut q).hint_text(hint).desired_width(240.0)).changed() {
-                    acts.push(Act::TaskQuery(q));
-                }
-            });
         });
         if let Some(e) = &self.task_error {
             ui.label(RichText::new(format!("{}  {e}", icon::WARN)).color(p.warn));
@@ -1361,7 +1404,23 @@ impl App {
                 });
             }
         });
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            if let (Some(q), _) = search_box(ui, p, "task_search", &self.task_query, "Search apps and tasks", 320.0) {
+                acts.push(Act::TaskQuery(q));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if let Some(f) = segmented(ui, p, &[(Filter::All, "All"), (Filter::Apps, "Apps"), (Filter::System, "System")], self.task_filter) {
+                    acts.push(Act::Filter(f));
+                }
+            });
+        });
         ui.add_space(10.0);
+        table(p).show(ui, |ui| self.task_table(ui, p, s, acts));
+    }
+
+    fn task_table(&self, ui: &mut Ui, p: &Pal, s: &Snapshot, acts: &mut Vec<Act>) {
+        ui.set_min_size(ui.available_size());
         let (head, _) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
         let y = head.center().y;
         let mut head_cell = |col: Col, label: &str, pos: egui::Pos2, align: Align2| {
