@@ -7,7 +7,7 @@ use eframe::egui::{
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
@@ -39,6 +39,7 @@ mod icon {
     pub const UP: &str = "\u{E74A}";
     pub const TASKS: &str = "\u{E9D9}";
     pub const KILL: &str = "\u{E711}";
+    pub const SEARCH: &str = "\u{E721}";
 }
 
 /// macOS and Linux: glyphs from egui's bundled emoji-icon-font / Noto Emoji.
@@ -69,6 +70,7 @@ mod icon {
     pub const UP: &str = "⬆";
     pub const TASKS: &str = "📊";
     pub const KILL: &str = "✖";
+    pub const SEARCH: &str = "🔍";
 }
 
 /// Menu label for "reveal this in the system file manager".
@@ -381,7 +383,17 @@ enum Act {
     /// First click on "End task" for a system process: ask again.
     Arm,
     Kill(Vec<u32>),
+    /// File search box text changed.
+    Search(String),
+    RunSearch,
+    ClearSearch,
+    /// Task manager search box text changed.
+    TaskQuery(String),
 }
+
+/// Most results a file search keeps; more means the query is too vague to read through anyway.
+const MAX_FOUND: usize = 1000;
+type Found = (PathBuf, u64, bool);
 
 type FileCache = HashMap<PathBuf, Vec<(String, u64, bool)>>;
 
@@ -547,6 +559,13 @@ pub struct App {
     task_sel: Option<(String, Option<u32>)>,
     task_armed: bool,
     task_error: Option<String>,
+    task_query: String,
+    search: String,
+    /// The query whose results are shown instead of the tree.
+    searched: Option<String>,
+    found: Vec<Found>,
+    found_rx: Option<mpsc::Receiver<Found>>,
+    found_stop: Arc<AtomicBool>,
 }
 
 impl App {
@@ -580,9 +599,69 @@ impl App {
             task_sel: None,
             task_armed: false,
             task_error: None,
+            task_query: String::new(),
+            search: String::new(),
+            searched: None,
+            found: vec![],
+            found_rx: None,
+            found_stop: Arc::default(),
         };
         app.refresh();
         app
+    }
+
+    fn run_search(&mut self) {
+        self.stop_search();
+        let q = self.search.trim().to_lowercase();
+        let Some(s) = self.scan.as_ref().filter(|_| !q.is_empty()) else { return };
+        let roots: Vec<PathBuf> = if self.focus.as_os_str().is_empty() {
+            s.drives.iter().filter(|d| d.scanned()).map(|d| PathBuf::from(&d.root)).collect()
+        } else {
+            vec![self.focus.clone()]
+        };
+        let (tx, rx) = mpsc::channel();
+        let stop = self.found_stop.clone();
+        let query = q.clone();
+        std::thread::spawn(move || roots.iter().for_each(|r| scan::search(r, &query, &stop, &tx)));
+        self.found_rx = Some(rx);
+        self.searched = Some(q);
+    }
+
+    /// Ends a running search and goes back to the tree.
+    fn stop_search(&mut self) {
+        self.found_stop.store(true, Ordering::Relaxed);
+        self.found_stop = Arc::default();
+        self.found_rx = None;
+        self.found = vec![];
+        self.searched = None;
+    }
+
+    /// Takes in what the search found since the last frame, biggest first.
+    fn poll_search(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.found_rx else { return };
+        let before = self.found.len();
+        let done = loop {
+            match rx.try_recv() {
+                Ok(mut f) if self.found.len() < MAX_FOUND => {
+                    if let Some(d) = self.scan.as_ref().and_then(|s| s.find(&f.0)).filter(|_| f.2) {
+                        f.1 = d.size; // folders: total size from the scan
+                    }
+                    self.found.push(f);
+                }
+                Ok(_) => break true,
+                Err(mpsc::TryRecvError::Empty) => break false,
+                Err(mpsc::TryRecvError::Disconnected) => break true,
+            }
+        };
+        if self.found.len() != before {
+            self.found.sort_by(|a, b| b.1.cmp(&a.1));
+        }
+        if done {
+            self.found_stop.store(true, Ordering::Relaxed);
+            self.found_rx = None;
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(150));
+        }
     }
 
     fn refresh(&mut self) {
@@ -706,9 +785,41 @@ impl App {
         });
     }
 
+    fn search_bar(&self, ui: &mut Ui, p: &Pal, acts: &mut Vec<Act>) {
+        ui.horizontal(|ui| {
+            let mut q = self.search.clone();
+            let place = if self.focus.as_os_str().is_empty() { "This PC".into() } else { display_name(&self.focus) };
+            let hint = format!("{}  Search files in {place}, press Enter", icon::SEARCH);
+            let r = ui.add(egui::TextEdit::singleline(&mut q).hint_text(hint).desired_width(360.0));
+            if r.changed() {
+                acts.push(Act::Search(q));
+            }
+            if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                acts.push(Act::RunSearch);
+            }
+            if self.searched.is_some() {
+                if ui.button("Clear").clicked() {
+                    acts.push(Act::ClearSearch);
+                }
+                let n = self.found.len();
+                let status = match (self.found_rx.is_some(), n) {
+                    (true, _) => format!("Searching… {} found", num(n as u64)),
+                    (false, MAX_FOUND) => format!("First {} results, type more to narrow it down", num(n as u64)),
+                    (false, _) => format!("{} found", num(n as u64)),
+                };
+                if self.found_rx.is_some() {
+                    ui.add(egui::Spinner::new().size(14.0).color(p.accent));
+                }
+                ui.label(RichText::new(status).color(p.weak));
+            }
+        });
+    }
+
     fn explorer_view(&self, ui: &mut Ui, p: &Pal, acts: &mut Vec<Act>) {
         self.header(ui, p, acts);
-        ui.add_space(10.0);
+        ui.add_space(8.0);
+        self.search_bar(ui, p, acts);
+        ui.add_space(8.0);
         egui::Frame::new().show(ui, |ui| {
             ui.set_min_size(ui.available_size());
             let (head, _) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
@@ -720,6 +831,25 @@ impl App {
             text(ui, pos2(r - 148.0, y), Align2::RIGHT_CENTER, "Size", f.clone(), p.weak);
             text(ui, pos2(r - 96.0, y), Align2::CENTER_CENTER, "Share", f, p.weak);
             ui.painter().hline(head.x_range(), head.bottom(), Stroke::new(1.0, p.stroke));
+            if self.searched.is_some() {
+                if self.found.is_empty() && self.found_rx.is_none() {
+                    ui.add_space(40.0);
+                    ui.vertical_centered(|ui| ui.label(RichText::new("Nothing found").color(p.weak)));
+                }
+                let s = self.scan.as_ref().unwrap();
+                let biggest = self.found.first().map_or(1, |f| f.1);
+                ui.spacing_mut().item_spacing.y = 0.0;
+                egui::ScrollArea::vertical().auto_shrink(false).show_rows(ui, ROW_H, self.found.len(), |ui, range| {
+                    for i in range {
+                        let (path, size, dir) = &self.found[i];
+                        let name = path.strip_prefix(&self.focus).unwrap_or(path).display().to_string();
+                        let files = s.find(path).map_or(0, |d| d.files);
+                        let row = Row { depth: 0.0, name, size: *size, local: *size, files, parent: biggest, path: path.clone(), dir: *dir, open: false, synced: s.synced(path).is_some() };
+                        self.row(ui, p, &row, i, acts);
+                    }
+                });
+                return;
+            }
             if self.rows.is_empty() {
                 ui.add_space(40.0);
                 ui.vertical_centered(|ui| ui.label(RichText::new("This folder is empty").color(p.weak)));
@@ -1203,6 +1333,11 @@ impl App {
                         acts.push(Act::Filter(f));
                     }
                 }
+                let mut q = self.task_query.clone();
+                let hint = format!("{}  Search apps and tasks", icon::SEARCH);
+                if ui.add(egui::TextEdit::singleline(&mut q).hint_text(hint).desired_width(240.0)).changed() {
+                    acts.push(Act::TaskQuery(q));
+                }
             });
         });
         if let Some(e) = &self.task_error {
@@ -1244,12 +1379,20 @@ impl App {
         }
         ui.painter().hline(head.x_range(), head.bottom(), Stroke::new(1.0, p.stroke));
 
+        let q = self.task_query.trim().to_lowercase();
+        let hit = |name: &str, exe: &Path| name.to_lowercase().contains(&q) || exe.to_string_lossy().to_lowercase().contains(&q);
         let mut rows: Vec<(&Group, Option<&Proc>)> = vec![];
         for g in &s.groups {
             if self.task_filter == Filter::All || (self.task_filter == Filter::System) == g.system {
+                // a search shows every app whose name matches, and the matching sub-tasks of the others
+                let whole = q.is_empty() || g.name.to_lowercase().contains(&q);
+                let subs: Vec<&Proc> = g.procs.iter().filter(|x| whole || hit(&x.name, &x.exe)).collect();
+                if subs.is_empty() {
+                    continue;
+                }
                 rows.push((g, None));
-                if g.procs.len() > 1 && self.task_open.contains(&g.name) {
-                    rows.extend(g.procs.iter().map(|x| (g, Some(x))));
+                if g.procs.len() > 1 && (self.task_open.contains(&g.name) || !whole) {
+                    rows.extend(subs.into_iter().map(|x| (g, Some(x))));
                 }
             }
         }
@@ -1275,7 +1418,9 @@ impl App {
         let arrow = Rect::from_min_max(pos2(x - 6.0, rect.top()), pos2(x + 18.0, rect.bottom()));
         let many = pr.is_none() && g.procs.len() > 1;
         if many {
-            let a = if self.task_open.contains(&g.name) { icon::DOWN } else { icon::RIGHT };
+            let q = self.task_query.trim().to_lowercase();
+            let by_search = !q.is_empty() && !g.name.to_lowercase().contains(&q); // only its matching sub-tasks are listed
+            let a = if by_search || self.task_open.contains(&g.name) { icon::DOWN } else { icon::RIGHT };
             text(ui, pos2(x + 6.0, y), Align2::CENTER_CENTER, a, FontId::proportional(10.0), weak);
         }
         let clip = Rect::from_x_y_ranges(x + 22.0..=col_right(rect, 0) - 96.0, rect.y_range());
@@ -1417,7 +1562,10 @@ impl eframe::App for App {
         if self.dirty {
             self.dirty = false;
             self.rows.clear();
-            if let Some(s) = &self.scan {
+            if let Some(s) = &mut self.scan {
+                s.expand(&self.focus);
+                self.open.iter().for_each(|p| s.expand(p));
+                self.files.retain(|k, _| *k == self.focus || self.open.contains(k)); // closed folders: list again when reopened
                 if let Some(d) = s.find(&self.focus) {
                     walk(d, &self.focus, 0.0, &self.open, &mut self.files, s, &mut self.rows);
                 }
@@ -1430,6 +1578,7 @@ impl eframe::App for App {
         if self.view == View::Tasks {
             self.poll_tasks(&ctx);
         }
+        self.poll_search(&ctx);
 
         let p = pal(ctx.theme() == egui::Theme::Dark, self.accent);
         let mut acts = vec![];
@@ -1454,6 +1603,7 @@ impl eframe::App for App {
         for a in acts {
             match a {
                 Act::Focus(path) => {
+                    self.stop_search();
                     if self.scan.as_ref().is_some_and(|s| s.find(&path).is_some()) {
                         self.focus = path;
                         self.selected = None;
@@ -1469,7 +1619,12 @@ impl eframe::App for App {
                     }
                     self.dirty = true;
                 }
-                Act::Select(path) => self.selected = Some(path),
+                Act::Select(path) => {
+                    if let Some(s) = &mut self.scan {
+                        s.expand(&path); // the details pane lists its subfolders
+                    }
+                    self.selected = Some(path);
+                }
                 Act::View(v) => {
                     self.view = v;
                     self.task_quick = 2;
@@ -1494,6 +1649,10 @@ impl eframe::App for App {
                     self.task_error = None;
                 }
                 Act::Arm => self.task_armed = true,
+                Act::TaskQuery(q) => self.task_query = q,
+                Act::Search(q) => self.search = q,
+                Act::ClearSearch => self.stop_search(),
+                Act::RunSearch => self.run_search(),
                 Act::Kill(pids) => {
                     self.task_wait = self.task_tx.send(Cmd::Kill(pids)).is_ok();
                     self.task_armed = false;

@@ -3,8 +3,8 @@
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::{MAIN_SEPARATOR, Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, mpsc};
 #[cfg(windows)]
 use winreg::RegKey;
 #[cfg(windows)]
@@ -34,6 +34,9 @@ pub fn cloud_only(_: &std::fs::Metadata) -> bool {
 #[cfg(target_os = "macos")]
 const SKIP: [&str; 5] = ["/Volumes", "/System/Volumes", "/dev", "/net", "/home"];
 const BIG_FILE: u64 = 64 << 20;
+/// Folders smaller than this keep only their totals; what is inside is scanned again when opened.
+/// Most folders are tiny (95% of 456k on a test PC), so this cuts the tree's memory ~20x.
+const KEEP: u64 = 16 << 20;
 
 /// Only directories are kept in memory; files are listed on demand when a folder is opened.
 pub struct Dir {
@@ -43,6 +46,8 @@ pub struct Dir {
     pub local: u64,
     pub files: u64,
     pub dirs: Vec<Dir>,
+    /// Subfolders were dropped to save memory (see KEEP); `Scan::expand` brings them back.
+    cut: bool,
 }
 
 pub struct Drive {
@@ -108,11 +113,28 @@ impl Scan {
         find(&self.root, &names_of(path, &self.drives))
     }
 
+    /// Rescans the cut folders on the way to `path`, so it and its subfolders are in the tree.
+    pub fn expand(&mut self, path: &Path) {
+        expand(&mut self.root, names_of(path, &self.drives));
+    }
+
     /// The sync root this path is inside of, if any.
     pub fn synced(&self, path: &Path) -> Option<&SyncRoot> {
         let s = path.to_string_lossy().to_lowercase();
         let s = s.trim_end_matches(MAIN_SEPARATOR);
         self.sync.iter().find(|r| s == r.key || s.strip_prefix(&r.key).is_some_and(|t| t.starts_with(MAIN_SEPARATOR)))
+    }
+}
+
+fn expand(mut d: &mut Dir, names: Vec<String>) {
+    let mut at = PathBuf::new();
+    for n in names {
+        at.push(&n);
+        let Some(c) = d.dirs.iter_mut().find(|x| x.name == n) else { return };
+        if c.cut {
+            *c = scan(&at, n, &AtomicU64::new(0), &Acc::default());
+        }
+        d = c;
     }
 }
 
@@ -148,18 +170,7 @@ fn scan(path: &Path, name: String, count: &AtomicU64, acc: &Acc) -> Dir {
             }
         }
     }
-    #[cfg(target_os = "macos")]
-    if path == Path::new("/") {
-        subs.retain(|n| !SKIP.iter().any(|s| path.join(n) == Path::new(s)));
-    }
-    // Linux, like `du -x`: /proc, /sys, tmpfs and other mounted drives are not part of this drive
-    #[cfg(not(any(windows, target_os = "macos")))]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if let Ok(dev) = std::fs::metadata(path).map(|m| m.dev()) {
-            subs.retain(|n| std::fs::symlink_metadata(path.join(n)).is_ok_and(|m| m.dev() == dev));
-        }
-    }
+    stay_on_drive(path, &mut subs);
     count.fetch_add(files, Ordering::Relaxed);
     if !exts.is_empty() {
         let mut all = acc.exts.lock().unwrap();
@@ -174,12 +185,54 @@ fn scan(path: &Path, name: String, count: &AtomicU64, acc: &Acc) -> Dir {
         .map(|n| scan(&path.join(n), n.to_string_lossy().into(), count, acc))
         .collect();
     dirs.sort_by(|a, b| b.size.cmp(&a.size));
-    for d in &dirs {
+    for d in &mut dirs {
         size += d.size;
         local += d.local;
         files += d.files;
+        if d.size < KEEP && !d.dirs.is_empty() {
+            d.dirs = Vec::new();
+            d.cut = true;
+        }
     }
-    Dir { name, size, local, files, dirs }
+    Dir { name, size, local, files, dirs, cut: false }
+}
+
+/// Drops subfolders that belong to another drive or would be counted twice.
+#[cfg_attr(windows, allow(unused_variables))]
+fn stay_on_drive(path: &Path, subs: &mut Vec<std::ffi::OsString>) {
+    #[cfg(target_os = "macos")]
+    if path == Path::new("/") {
+        subs.retain(|n| !SKIP.iter().any(|s| path.join(n) == Path::new(s)));
+    }
+    // Linux, like `du -x`: /proc, /sys, tmpfs and other mounted drives are not part of this drive
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(dev) = std::fs::metadata(path).map(|m| m.dev()) {
+            subs.retain(|n| std::fs::symlink_metadata(path.join(n)).is_ok_and(|m| m.dev() == dev));
+        }
+    }
+}
+
+/// (path, size, is folder) of everything under `root` whose name contains `q` (lowercase), sent as
+/// soon as found. Stops when `stop` is set or the receiver is gone.
+// ponytail: walks the disk on every search (seconds on a big drive); an index of names would make it instant but cost RAM
+pub fn search(root: &Path, q: &str, stop: &AtomicBool, tx: &mpsc::Sender<(PathBuf, u64, bool)>) {
+    if stop.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut subs = Vec::new();
+    for e in entries(root) {
+        if e.name.to_string_lossy().to_lowercase().contains(q) && tx.send((root.join(&e.name), e.len, e.dir)).is_err() {
+            stop.store(true, Ordering::Relaxed);
+            return;
+        }
+        if e.dir {
+            subs.push(e.name);
+        }
+    }
+    stay_on_drive(root, &mut subs);
+    subs.par_iter().for_each(|n| search(&root.join(n), q, stop, tx));
 }
 
 pub fn scan_all(count: &AtomicU64) -> Scan {
@@ -188,7 +241,7 @@ pub fn scan_all(count: &AtomicU64) -> Scan {
     let mut dirs: Vec<Dir> = drives.par_iter().filter(|d| d.scanned()).map(|d| scan(Path::new(&d.root), d.root.clone(), count, &acc)).collect();
     dirs.sort_by(|a, b| b.size.cmp(&a.size));
     let sum = |f: fn(&Dir) -> u64| dirs.iter().map(f).sum();
-    let root = Dir { name: "This PC".into(), size: sum(|d| d.size), local: sum(|d| d.local), files: sum(|d| d.files), dirs };
+    let root = Dir { name: "This PC".into(), size: sum(|d| d.size), local: sum(|d| d.local), files: sum(|d| d.files), dirs, cut: false };
     let mut big = acc.big.into_inner().unwrap();
     big.sort_by(|a, b| b.0.cmp(&a.0));
     big.truncate(100);
@@ -542,7 +595,19 @@ fn scan_sums_nested_sizes() {
     std::fs::write(root.join("a/b/z.txt"), [0; 30]).unwrap();
     let (n, acc) = (AtomicU64::new(0), Acc::default());
     let d = scan(&root, "t".into(), &n, &acc);
-    assert_eq!((d.size, d.dirs[0].size, d.dirs[0].dirs[0].size), (60, 50, 30));
+    assert_eq!((d.size, d.dirs[0].size), (60, 50));
+    // "a" is small, so "b" was dropped from memory; expanding "a" scans it again
+    assert!(d.dirs[0].cut && d.dirs[0].dirs.is_empty());
+    let mut pc = Dir { name: String::new(), size: 0, local: 0, files: 0, cut: false, dirs: vec![d] };
+    let top = root.to_string_lossy().to_string();
+    pc.dirs[0].name = top.clone();
+    expand(&mut pc, vec![top, "a".into()]);
+    assert_eq!(pc.dirs[0].dirs[0].dirs[0].size, 30);
+    let d = pc.dirs.pop().unwrap();
+    let (tx, rx) = mpsc::channel();
+    search(&root, "z.t", &AtomicBool::new(false), &tx);
+    drop(tx);
+    assert_eq!(rx.iter().map(|f| (f.0, f.1, f.2)).collect::<Vec<_>>(), [(root.join("a/b/z.txt"), 30, false)]);
     assert_eq!((d.local, d.files, n.load(Ordering::Relaxed)), (60, 3, 3));
     assert_eq!(acc.exts.lock().unwrap()["txt"], (40, 2));
     #[cfg(windows)]
